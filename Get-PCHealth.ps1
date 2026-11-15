@@ -933,6 +933,34 @@ $script:StorePackages = [ordered]@{
 Invoke-Step 'Driver inventory' {
     $script:AllDrv = @(Get-Cim 'Win32_PnPSignedDriver' | Where-Object { $_.DriverVersion -and $_.DeviceName })
 }
+$script:StoreDamaged = $false
+# When the store is reported damaged, read Windows' own repair log to say WHAT is damaged and whether
+# earlier repairs actually fixed it. Only the tail of the log is read; it can be tens of megabytes.
+function Add-StoreRepairEvidence {
+    try {
+        $path = Join-Path $env:SystemRoot 'Logs\CBS\CBS.log'
+        if (-not (Test-Path $path)) { Add-Finding 'windows' 'gap' 'Windows'' repair log was not found' 'CBS.log is where each scan and repair records what it found.' '' ''; return }
+        $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $max = 40MB
+            if ($fs.Length -gt $max) { [void]$fs.Seek(-1 * $max, [IO.SeekOrigin]::End) }
+            $sr = New-Object IO.StreamReader($fs)
+            $lines = $sr.ReadToEnd() -split "`r?`n"
+        } finally { $fs.Dispose() }
+        $sessions = @(Get-CbsRepairSessions $lines)
+        $v = Get-CbsRepairVerdict $sessions
+        if (-not $v) {
+            Add-Finding 'windows' 'gap' 'Windows'' repair log holds no completed scan or repair record' 'The log has probably been rotated since the last repair, so it cannot show what was found or fixed.' 'Run DISM /Online /Cleanup-Image /RestoreHealth, then re-run this report straight afterwards so the log still holds the record.' ''
+            return
+        }
+        Add-Finding 'windows' $v.Sev $v.Title $v.Detail $v.Action ''
+        $rows = New-Rows
+        foreach ($x in ($sessions | Where-Object { $_.Complete } | Select-Object -Last 8)) {
+            [void]$rows.Add(@([string]$x.When, [string]$x.Operation, [string]$x.Detected, [string]$x.Repaired, (Get-Short (($x.Items | Select-Object -First 4) -join '; ') 300), (($x.Failed | Select-Object -Unique) -join '; ')))
+        }
+        Add-Table 'windows' 'Component store scans and repairs recorded by Windows' @('When', 'Operation', 'Damaged items found', 'Repaired', 'Components named', 'Repair failures') $rows 'From C:\Windows\Logs\CBS\CBS.log. "Detect only" is a scan; "Detect and Repair" is the RestoreHealth command.' $false
+    } catch { [void]$script:Errors.Add('Windows repair log could not be read: ' + $_.Exception.Message) }
+}
 Invoke-Step 'Windows installation' {
     $os = Get-Cim 'Win32_OperatingSystem' | Select-Object -First 1
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
@@ -941,6 +969,8 @@ Invoke-Step 'Windows installation' {
         Add-Fact 'windows' 'Version' ('{0} (build {1}.{2})' -f $cv.DisplayVersion, $os.BuildNumber, $cv.UBR)
         Add-Fact 'windows' 'Installed' (Format-Day $os.InstallDate)
         $script:Snap.build = ('{0}.{1}' -f $os.BuildNumber, $cv.UBR)
+        $ins = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\WindowsSelfHost\Applicability' -ErrorAction SilentlyContinue
+        if ($ins -and $ins.BranchName) { Add-Fact 'windows' 'Windows Insider channel' ('{0} (pre-release builds)' -f $ins.BranchName) }
         Add-Fact 'windows' 'Last boot' (Format-Stamp $os.LastBootUpTime)
         $up = ($started - $os.LastBootUpTime).TotalDays
         if ($up -ge 14) {
@@ -974,10 +1004,12 @@ Invoke-Step 'Windows installation' {
             $scan = Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop
             $state = [string]$scan.ImageHealthState
             $sev = 'ok'; if ($state -eq 'Repairable') { $sev = 'warn' } elseif ($state -ne 'Healthy') { $sev = 'crit' }
+            $script:StoreDamaged = ($sev -ne 'ok')
             Add-Finding 'windows' $sev $(if ($sev -eq 'ok') { 'Windows component store is healthy (full scan)' } else { 'Windows component store is damaged ({0})' -f $state }) `
                 $(if ($sev -eq 'ok') { 'Full read-only DISM scan of the store Windows uses to install updates and repair itself.' } else { 'Windows keeps a private store of spare copies of its own files, used to install updates and to repair itself. A full scan found damage in that store. The files Windows is running from are checked separately by SFC (see its result). Left alone, future updates may fail and self-repair may not work.' }) `
                 $(if ($sev -ne 'ok') { 'From an administrator prompt run: DISM /Online /Cleanup-Image /RestoreHealth   It downloads fresh copies from Microsoft and takes 10 to 20 minutes. Then restart.' } else { '' }) ''
         } catch { Add-Finding 'windows' 'info' 'DISM ScanHealth could not complete' $_.Exception.Message '' '' }
+        if ($script:StoreDamaged) { Add-StoreRepairEvidence }
         Write-Host '      deep scan: SFC /verifyonly (several minutes)...'
         & "$env:SystemRoot\System32\sfc.exe" /verifyonly | Out-Null
         if ($LASTEXITCODE -eq 0) {

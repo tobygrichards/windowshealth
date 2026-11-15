@@ -384,5 +384,44 @@ Check 'Gigabyte search page' (Get-BoardSupportUrl 'Gigabyte Technology Co., Ltd.
 Check 'unknown maker' (Get-BoardSupportUrl 'Dell Inc.' '0XYZ' 'Intel') ''
 Check 'board devices: sound and LAN, not GPU audio or virtual' ((Select-BoardDeviceDrivers $inst | ForEach-Object { $_.DeviceName }) -join ',') 'Realtek High Definition Audio,Realtek PCIe GbE Family Controller'
 
+# ---- Windows' repair log (CBS.log)
+function CbsBlock($time, $op, $detected, $repaired, $items, $failed) {
+    $l = @("$time, Info                  CBS    Checking System Update Readiness.")
+    foreach ($i in $items) { $l += "$time, Info                  CBS    (p)`tCSI Payload Corrupt`t(n)`t`t`t$i" }
+    foreach ($x in $failed) { $l += "$time, Info                  CBS    Repair failed: $x" }
+    $l += "$time, Info                  CBS    Summary:"
+    $l += "$time, Info                  CBS    Operation: $op "
+    $l += "$time, Info                  CBS    Operation result: 0x0"
+    $l += "$time, Info                  CBS    Total Detected Corruption:`t$detected"
+    $l += "$time, Info                  CBS    `tCSI Payload Corruption:`t$detected"
+    $l += "$time, Info                  CBS    Total Repaired Corruption:`t$repaired"
+    $l += "$time, Info                  CBS    Total Operation Time: 80 seconds."
+    return $l
+}
+$item = 'amd64_microsoft-windows-foo_31bf3856ad364e35_10.0.26300.1_none_abc\foo.dll'
+$logA = @('2026-11-15 15:00:00, Info                  CBS    unrelated line') +
+    (CbsBlock '2026-11-15 15:10:00' 'Detect and Repair' 2 0 @($item, 'amd64_bar_1\bar.dll') @('Missing replacement payload.', 'Missing replacement payload.')) +
+    (CbsBlock '2026-11-15 15:42:00' 'Detect only' 2 0 @($item) @())
+$sa = Get-CbsRepairSessions $logA
+Check 'cbs: two sessions parsed' @($sa).Count 2
+Check 'cbs: operation' $sa[0].Operation 'Detect and Repair'
+Check 'cbs: detected' $sa[0].Detected 2
+Check 'cbs: repaired' $sa[0].Repaired 0
+Check 'cbs: corrupt item named' ($sa[0].Items[0] -match 'CSI Payload Corrupt: amd64_microsoft-windows-foo') $true
+Check 'cbs: repair failure reason' $sa[0].Failed[0] 'Missing replacement payload.'
+Check 'cbs: time' $sa[1].When '2026-11-15 15:42'
+$va = Get-CbsRepairVerdict $sa
+Check 'cbs verdict: repair could not fix' ($va.Title -match 'could not fix 2 of 2') $true
+Check 'cbs verdict: says repeating will not help' ($va.Action -match 'Repeating the same command will not help') $true
+Check 'cbs verdict: reason included' ($va.Detail -match 'Missing replacement payload') $true
+$vb = Get-CbsRepairVerdict (Get-CbsRepairSessions ((CbsBlock '2026-11-15 15:10:00' 'Detect and Repair' 1 1 @($item) @()) + (CbsBlock '2026-11-15 15:42:00' 'Detect only' 1 0 @($item) @())))
+Check 'cbs verdict: repaired but found again' ($vb.Title -match 'later scan found the damage again') $true
+$vc = Get-CbsRepairVerdict (Get-CbsRepairSessions (CbsBlock '2026-11-15 15:42:00' 'Detect only' 1 0 @($item) @()))
+Check 'cbs verdict: no repair recorded' ($vc.Title -match 'no repair attempt') $true
+$vd2 = Get-CbsRepairVerdict (Get-CbsRepairSessions (CbsBlock '2026-11-15 15:10:00' 'Detect and Repair' 1 1 @($item) @()))
+Check 'cbs verdict: repair fixed everything' ($vd2.Title -match 'fixed everything') $true
+Check 'cbs verdict: empty log' ($null -eq (Get-CbsRepairVerdict (Get-CbsRepairSessions @('nothing', $null)))) $true
+Check 'cbs: unfinished session is ignored' @(Get-CbsRepairSessions @('2026-11-15 15:10:00, Info                  CBS    Checking System Update Readiness.')).Count 0
+
 Write-Host ('{0} passed, {1} failed' -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $script:Fail

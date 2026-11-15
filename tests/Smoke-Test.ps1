@@ -101,7 +101,8 @@ function global:Get-PhysicalDisk {
 }
 function global:Get-StorageReliabilityCounter { param([Parameter(ValueFromPipeline)]$d, $ErrorAction) process { [pscustomobject]@{ Wear = 0; Temperature = 34; PowerOnHours = 900; ReadErrorsUncorrected = 0; WriteErrorsUncorrected = 0 } } }
 function global:Get-Volume { [pscustomobject]@{ DriveLetter = 'C'; Size = 600GB; SizeRemaining = 277GB; DriveType = 'Fixed'; FileSystemLabel = ''; FileSystem = 'NTFS'; HealthStatus = 'Healthy' } }
-foreach ($n in 'Confirm-SecureBootUEFI', 'Get-Tpm', 'Get-HotFix', 'Get-MpComputerStatus', 'Get-WindowsDriver', 'Repair-WindowsImage', 'Get-AppxPackage', 'Get-Service') {
+function global:Repair-WindowsImage { param([switch]$Online, [switch]$CheckHealth, [switch]$ScanHealth, $ErrorAction) if ($ScanHealth) { [pscustomobject]@{ ImageHealthState = 'Repairable' } } else { [pscustomobject]@{ ImageHealthState = 'Healthy' } } }
+foreach ($n in 'Confirm-SecureBootUEFI', 'Get-Tpm', 'Get-HotFix', 'Get-MpComputerStatus', 'Get-WindowsDriver', 'Get-AppxPackage', 'Get-Service') {
     Set-Item -Path "function:global:$n" -Value { throw 'not available in the simulation' }
 }
 
@@ -187,7 +188,26 @@ Expect 'MSI board: not compared automatically, with the exact support page linke
 Expect 'MSI board: compare-by-hand table lists audio, LAN and BIOS' (@(((Area 'drivers').tables | Where-Object { $_.title -match '^Compare by hand' }).rows).Count -eq 3)
 $global:BoardMaker = 'ASUSTeK COMPUTER INC.'; $global:BoardProduct = 'ROG STRIX X570-E GAMING WIFI II'
 
-# 6. a FAILED event-log query must not produce an all-clear
+# 6. deep scan finds the store damaged: the repair log explains why repairs have not fixed it
+$fakeRoot = Join-Path ([IO.Path]::GetTempPath()) 'pchealth-fakewin'
+New-Item -ItemType Directory -Path (Join-Path $fakeRoot 'Logs/CBS') -Force | Out-Null
+$t1 = '2026-11-15 15:10:00, Info                  CBS    '; $t2 = '2026-11-15 15:42:00, Info                  CBS    '
+@("${t1}Checking System Update Readiness.", "${t1}(p)`tCSI Payload Corrupt`t(n)`t`t`tamd64_microsoft-windows-foo_1\foo.dll", "${t1}Repair failed: Missing replacement payload.",
+  "${t1}Operation: Detect and Repair ", "${t1}Total Detected Corruption:`t1", "${t1}Total Repaired Corruption:`t0", "${t1}Total Operation Time: 60 seconds.",
+  "${t2}Checking System Update Readiness.", "${t2}(p)`tCSI Payload Corrupt`t(n)`t`t`tamd64_microsoft-windows-foo_1\foo.dll",
+  "${t2}Operation: Detect only ", "${t2}Total Detected Corruption:`t1", "${t2}Total Repaired Corruption:`t0", "${t2}Total Operation Time: 30 seconds.") | Set-Content (Join-Path $fakeRoot 'Logs/CBS/CBS.log')
+$oldRoot = $env:SystemRoot; $env:SystemRoot = $fakeRoot
+function global:sfc.exe { $global:LASTEXITCODE = 0 }
+$OutDir3 = $OutDir + '-deep'; Remove-Item $OutDir3 -Recurse -Force -ErrorAction SilentlyContinue
+$deepSrc = $src.Replace('& "$env:SystemRoot\System32\sfc.exe" /verifyonly | Out-Null', '$global:LASTEXITCODE = 0').Replace("'Logs\CBS\CBS.log'", "'Logs/CBS/CBS.log'")
+& ([scriptblock]::Create($deepSrc)) -NoSensors -Offline -NoOpen -DeepScan -OutDir $OutDir3 *> $null
+$env:SystemRoot = $oldRoot
+$r = Get-Content (Get-ChildItem $OutDir3 -Filter '*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
+Expect 'deep scan: store reported damaged' (Has 'windows' 'warn' 'component store is damaged')
+Expect 'deep scan: repair log explains the repair could not fix it' (Has 'windows' 'warn' 'could not fix 1 of 1')
+Expect 'deep scan: repair history table' (@(((Area 'windows').tables | Where-Object { $_.title -match '^Component store scans' }).rows).Count -eq 2)
+
+# 7. a FAILED event-log query must not produce an all-clear
 function global:Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) Write-Error -Message 'Access is denied' -ErrorId 'System.UnauthorizedAccessException' -ErrorAction Stop }
 $OutDir2 = $OutDir + '-denied'
 Remove-Item $OutDir2 -Recurse -Force -ErrorAction SilentlyContinue

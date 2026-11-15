@@ -695,3 +695,64 @@ function Select-BoardDeviceDrivers($drivers) {
             $n -notmatch 'Virtual|WAN Miniport|Wi-Fi Direct|Hyper-V|Loopback|Enumerator|RFCOMM|Display Audio|TAP-|VPN'
         })
 }
+
+# ------------------------------------------------------------------------------------------------
+# Windows' own record of component-store scans and repairs (C:\Windows\Logs\CBS\CBS.log)
+
+# Every DISM ScanHealth / RestoreHealth writes a block to CBS.log: the items it found corrupt, any that
+# could not be repaired, and a summary with detected and repaired counts. Returns one object per block,
+# oldest first: When, Operation, Detected, Repaired, Items (corrupt components), Failed (repair failures).
+function Get-CbsRepairSessions($lines) {
+    $out = New-Object System.Collections.ArrayList
+    $cur = $null
+    foreach ($raw in $lines) {
+        if ($null -eq $raw) { continue }
+        $when = ''; $text = [string]$raw
+        if ($text -match '^(\d{4}-\d\d-\d\d \d\d:\d\d):\d\d, \w+\s+CBS\s+(.*)$') { $when = $Matches[1]; $text = $Matches[2] }
+        if ($text -match 'Checking System Update Readiness') {
+            $cur = [pscustomobject]@{ When = $when; Operation = ''; Detected = $null; Repaired = $null; Items = @(); Failed = @(); Complete = $false }
+            continue
+        }
+        if ($null -eq $cur) { continue }
+        if ($text -match '^Operation:\s*(.+?)\s*$') { $cur.Operation = $Matches[1] }
+        elseif ($text -match 'Total Detected Corruption:\s*(\d+)') { $cur.Detected = [int]$Matches[1] }
+        elseif ($text -match 'Total Repaired Corruption:\s*(\d+)') { $cur.Repaired = [int]$Matches[1] }
+        elseif ($text -match 'Total Operation Time') { $cur.Complete = $true; [void]$out.Add($cur); $cur = $null }
+        elseif ($text -match '^\(\w\)\s+(.*Corrupt\S*)\s+(?:\(\w\)\s+)?(\S.*)$') { $cur.Items += ('{0}: {1}' -f ($Matches[1] -replace '\s+', ' ').Trim(), ($Matches[2] -replace '\s+', ' ').Trim()) }
+        elseif ($text -match '^Repair failed:\s*(.+?)\s*$') { $cur.Failed += $Matches[1] }
+    }
+    return $out
+}
+
+# Explains why the store is still reported damaged, from those sessions.
+# Returns @{ Sev; Title; Detail; Action } or $null when the log holds no completed session.
+function Get-CbsRepairVerdict($sessions) {
+    $all = @($sessions | Where-Object { $_ -and $_.Complete })
+    if ($all.Count -eq 0) { return $null }
+    $repairs = @($all | Where-Object { $_.Operation -match 'Repair' })
+    $last = $all[$all.Count - 1]
+    $lastRepair = $null; if ($repairs.Count -gt 0) { $lastRepair = $repairs[$repairs.Count - 1] }
+    $names = @($all | ForEach-Object { $_.Items } | Where-Object { $_ } | Select-Object -Unique)
+    $list = ''; if ($names.Count -gt 0) { $list = ' Components named in the log: ' + (($names | Select-Object -First 6) -join '; ') + '.' }
+    if (-not $lastRepair) {
+        return @{ Sev = 'info'; Title = 'The repair log shows scans but no repair attempt'
+            Detail = ('The most recent scan ({0}) detected {1} damaged item(s). No "Detect and Repair" operation is recorded in the current log, so either the repair has not been run or the log has since been rotated.{2}' -f $last.When, $last.Detected, $list)
+            Action = 'Run DISM /Online /Cleanup-Image /RestoreHealth from an administrator prompt, then re-run this report straight afterwards.' }
+    }
+    $unfixed = [int]$lastRepair.Detected - [int]$lastRepair.Repaired
+    if ($unfixed -gt 0) {
+        $why = ''; $reasons = @($lastRepair.Failed | Select-Object -Unique)
+        if ($reasons.Count -gt 0) { $why = ' Reason logged: ' + ($reasons -join '; ') + '.' }
+        return @{ Sev = 'warn'; Title = ('The repair ran but could not fix {0} of {1} damaged item(s)' -f $unfixed, $lastRepair.Detected)
+            Detail = ('The last repair ({0}) finished without an error message but repaired only {1} of {2}. That is why it "works" each time and the damage is still there.{3}{4} "Missing replacement payload" means Windows Update did not have a matching good copy of the file to download, which is typical when the installed build is newer or different from what the update servers hold (Insider and preview builds especially).' -f $lastRepair.When, $lastRepair.Repaired, $lastRepair.Detected, $why, $list)
+            Action = 'Repeating the same command will not help. Give DISM a matching source instead: mount the ISO for this exact Windows build and run DISM /Online /Cleanup-Image /RestoreHealth /Source:WIM:X:\sources\install.wim:1 /LimitAccess, or do an in-place repair install from that ISO (keeps files and apps).' }
+    }
+    if ($last.Operation -notmatch 'Repair' -and [int]$last.Detected -gt 0 -and $last.When -ge $lastRepair.When) {
+        return @{ Sev = 'warn'; Title = 'The repair reported success, but a later scan found the damage again'
+            Detail = ('The last repair ({0}) recorded {1} of {2} item(s) repaired, yet the scan at {3} detected {4} again.{5} When the same components come back after a successful repair, either something is changing those files after each repair (system "debloat" or tweaking tools and some security software do this), or the scan is flagging something that is not really damaged, which has happened on particular Windows builds.' -f $lastRepair.When, $lastRepair.Repaired, $lastRepair.Detected, $last.When, $last.Detected, $list)
+            Action = 'Look up the component names above together with this Windows build number: a known false positive will show up straight away. If the files are being changed by a tool, the names usually identify the feature it removed.' }
+    }
+    return @{ Sev = 'info'; Title = 'The repair log shows the last repair fixed everything it found'
+        Detail = ('The last repair ({0}) repaired {1} of {2} item(s) and no later scan in the log disagrees.{3}' -f $lastRepair.When, $lastRepair.Repaired, $lastRepair.Detected, $list)
+        Action = 'If this report still shows the store as damaged, restart and run it again; the scan here may have run before the repair was finalised.' }
+}
