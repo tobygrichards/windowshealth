@@ -160,7 +160,7 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
     }
 }
 function Get-Sens([string]$hwTypePattern, [string]$type) {
-    return @($script:Sensors | Where-Object { $_.Valid -and $_.HwType -match $hwTypePattern -and $_.Type -eq $type })
+    return @($script:Sensors | Where-Object { $_.Valid -and $_.HwType -match $hwTypePattern -and $_.Type -eq $type -and -not ($type -eq 'Temperature' -and $_.Name -match $script:RefSensor) })
 }
 function Get-TempSev([double]$v, [double]$warn, [double]$crit) {
     if ($v -ge $crit) { return 'crit' }
@@ -307,6 +307,17 @@ if (-not $NoSensors) {
     $script:SensorNote = 'Sensors disabled with -NoSensors.'
 }
 
+$script:RefSensor = 'Warning|Critical|Threshold|Limit|Resolution|Distance|TjMax|Offset'
+# @(warning, critical) temperature for a drive: its own published limits if present, else general guidance
+function Get-DriveTempLimits([string]$hwName) {
+    $w = 70; $c = 80
+    $own = @($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Type -eq 'Temperature' -and $_.Hw -eq $hwName })
+    $ow = $own | Where-Object { $_.Name -match 'Warning' -and $_.Value -gt 40 } | Select-Object -First 1
+    $oc = $own | Where-Object { $_.Name -match 'Critical' -and $_.Value -gt 40 } | Select-Object -First 1
+    if ($ow) { $w = $ow.Value }
+    if ($oc) { $c = $oc.Value } elseif ($ow) { $c = $ow.Value + 5 }
+    return @($w, $c)
+}
 # Returns @(severity, assessment text, finding detail or '' when another section already raises the finding)
 function Get-SensorVerdict($s) {
     if (-not $s.Valid) { return @('info', 'Invalid reading, ignored', '') }
@@ -317,12 +328,18 @@ function Get-SensorVerdict($s) {
         return @('ok', 'Within range', '')
     }
     if ($s.Type -eq 'Temperature') {
+        # thresholds, limits and offsets published by the device are reference values, not measurements
+        if ($n -match $script:RefSensor) { return @('', 'Reference value, not a reading', '') }
         if ($s.HwType -eq 'Cpu') { return (Limit $hi 85 95 'CPU' '') }
         if ($s.HwType -match '^Gpu') {
             if ($n -match 'Hot ?Spot') { return (Limit $hi 100 110 'GPU hot spot' 'The hot spot is the hottest point on the GPU die. A gap of more than about 25 C above the core temperature suggests dried thermal paste or poor cooler contact.') }
             return (Limit $hi 88 100 'GPU' '')
         }
-        if ($s.HwType -eq 'Storage') { return (Limit $hi 70 80 'drive' '') }
+        if ($s.HwType -eq 'Storage') {
+            # judge against the limits the drive itself publishes, when it does
+            $lim = Get-DriveTempLimits $s.Hw
+            return (Limit $hi ($lim[0] - 5) $lim[1] 'drive' '')
+        }
         if ($s.HwType -eq 'Memory') { return (Limit $hi 55 65 'memory' 'Hot memory produces errors, particularly with XMP / EXPO enabled.') }
         if ($n -match 'VRM|MOS') { return (Limit $hi 100 115 'VRM' 'The VRM feeds the CPU. Overheating VRMs throttle the CPU and cause shutdowns under load; improve airflow over the area around the CPU socket.') }
         if ($n -match 'Chipset|PCH') { return (Limit $hi 80 95 'chipset' 'X570 boards have a chipset fan; check it spins and is not clogged.') }
@@ -570,9 +587,11 @@ Invoke-Step 'Drives' {
         if ($r) {
             if ($r.Temperature) {
                 $temp = ('{0} C' -f $r.Temperature)
-                $limit = 70; if ($d.MediaType -eq 'HDD') { $limit = 55 }
+                $limit = 65; if ($d.MediaType -eq 'HDD') { $limit = 55 }
+                $ownW = $ls | Where-Object { $_.Type -eq 'Temperature' -and $_.Name -match 'Warning' -and $_.Value -gt 40 } | Select-Object -First 1
+                if ($ownW) { $limit = $ownW.Value - 5; $temp = ('{0} C (drive''s own warning limit {1:N0} C)' -f $r.Temperature, $ownW.Value) }
                 if ($r.Temperature -ge $limit) {
-                    Add-Finding 'drives' 'warn' ('{0} is at {1} C' -f $name, $r.Temperature) 'That is warm for a drive that is not being stressed.' 'Check airflow over the drive; M.2 drives under a GPU often benefit from a heatsink.' ''
+                    Add-Finding 'drives' 'warn' ('{0} is at {1} C' -f $name, $r.Temperature) 'That is close to the temperature at which the drive starts throttling itself.' 'Check airflow over the drive; M.2 drives under a GPU often benefit from a heatsink.' ''
                 }
             }
             if ($r.PowerOnHours) { $hours = ('{0:N0} h' -f $r.PowerOnHours) }
@@ -590,7 +609,8 @@ Invoke-Step 'Drives' {
         'Read from the drive''s own SMART / NVMe health log; no surface scan or write test is performed. SSDs report life used in whole percent of their rated endurance, so a drive reads "under 1 %" until about 1 % of its rated terabytes-written is consumed (roughly 6 TB on a 600 TBW drive). "Data written" is the figure to judge that against, and needs the sensor library. Life used does not apply to hard disks.' $false
     $smart = New-Rows
     foreach ($s in ($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Valid } | Sort-Object Hw, Type, Name)) {
-        [void]$smart.Add(@([string]$s.Hw, [string]$s.Name, [string]$s.Type, ('{0:N1}' -f $s.Value)))
+        $kind = [string]$s.Type; if ($s.Type -eq 'Temperature' -and $s.Name -match $script:RefSensor) { $kind = 'Limit set by the drive' }
+        [void]$smart.Add(@([string]$s.Hw, [string]$s.Name, $kind, ('{0:N1}' -f $s.Value)))
     }
     Add-Table 'drives' 'SMART detail per drive' @('Drive', 'Attribute', 'Kind', 'Value') $smart 'Kinds: Level = percent, Data = gigabytes, Temperature = Celsius.' $true
     if ($disks.Count -eq 0) { Add-Finding 'drives' 'info' 'Could not enumerate physical drives' 'Get-PhysicalDisk returned nothing; run elevated.' '' '' }
@@ -809,6 +829,30 @@ Invoke-Step 'Motherboard' {
 }
 
 # ------------------------------------------------------------------ Windows
+$script:UpdateErrors = @{
+    '0x80073D02' = 'The package was in use at the time, so Windows could not replace it.'
+    '0x80073CF9' = 'The package install failed, often through low disk space or a damaged Store cache.'
+    '0x80073CF3' = 'A dependency or conflict check failed for the package.'
+    '0x80073D06' = 'A newer version of the package is already installed.'
+    '0x80070005' = 'Access was denied, typically by security software or a permissions problem.'
+    '0x80070643' = 'The installer itself reported a fatal error.'
+    '0x800F0922' = 'The update could not complete; usually the system reserved partition is full or a VPN blocked the connection.'
+    '0x80240017' = 'The update was not applicable to this system.'
+    '0x8024200B' = 'The installer failed; frequent with driver updates for a device that has changed.'
+    '0x80246007' = 'The download did not complete.'
+    '0x80070002' = 'Files the update expected were missing; usually a damaged download cache.'
+    '0x800F081F' = 'Source files were missing from the component store.'
+}
+$script:StorePackages = [ordered]@{
+    'WindowsAppRuntime' = 'The Windows App SDK runtime: a shared framework from Microsoft that modern Windows apps (those built with WinUI 3) load instead of each shipping its own copy. It has no window of its own; you only notice it if an app that needs it will not start.'
+    'VCLibs' = 'The Microsoft Visual C++ runtime for Store apps: shared code many apps depend on.'
+    'UI\.Xaml' = 'The WinUI 2 interface framework that many Store apps depend on.'
+    'NET\.Native' = 'The .NET Native runtime that older Store apps depend on.'
+    'DesktopAppInstaller' = 'App Installer, which provides the winget package manager.'
+    'GamingServices' = 'Xbox Gaming Services, used by the Xbox app and Game Pass titles.'
+    'WebExperience' = 'The Windows Widgets board.'
+    'WindowsStore' = 'The Microsoft Store app itself.'
+}
 Invoke-Step 'Driver inventory' {
     $script:AllDrv = @(Get-Cim 'Win32_PnPSignedDriver' | Where-Object { $_.DriverVersion -and $_.DeviceName })
 }
@@ -914,10 +958,46 @@ Invoke-Step 'Windows installation' {
                     }
                     $failed += $f
                 }
-                if ($failed.Count -gt 0) {
-                    Add-Finding 'windows' 'warn' ('{0} update installation failure(s) in the last {1} days' -f $failed.Count, $Days) `
-                        ('Most recent: {0}' -f (Get-Short ([string]$failed[0].Title) 160)) 'If the same update keeps failing, run the deep scan and then the Windows Update troubleshooter.' ''
+                $frow = New-Rows
+                foreach ($g in ($failed | Group-Object { [string]$_.Title })) {
+                    $title = $g.Name
+                    $f = $g.Group | Sort-Object Date -Descending | Select-Object -First 1
+                    $hr = ''; try { $hr = '0x{0:X8}' -f [int]$f.HResult } catch {}
+                    $errTxt = $script:UpdateErrors[$hr]; if (-not $errTxt) { $errTxt = 'No built-in explanation for this code; search for it on Microsoft Learn.' }
+                    $sev = 'warn'; $what = 'An update delivered through Windows Update.'; $state = ''; $link = ''
+                    $fix = 'Settings > Windows Update > Check for updates to retry. If it fails repeatedly, run the Windows Update troubleshooter (Settings > System > Troubleshoot > Other troubleshooters).'
+                    if ($title -match '^9[A-Z0-9]{11}-(.+)$') {
+                        $pkg = $Matches[1]
+                        $what = 'A Microsoft Store package, not part of Windows itself. DISM and SFC do not cover Store packages, so a clean deep scan says nothing about it.'
+                        foreach ($k in $script:StorePackages.Keys) { if ($pkg -match $k) { $what = $script:StorePackages[$k] + ' It is a Microsoft Store package, so DISM and SFC do not cover it and a clean deep scan says nothing about it.'; break } }
+                        $inst = @(); $users = @()
+                        try {
+                            $inst = @(Get-AppxPackage -AllUsers -Name ($pkg + '*') -ErrorAction Stop)
+                            $users = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { @($_.Dependencies | Where-Object { $_.Name -like ($pkg + '*') }).Count -gt 0 } | ForEach-Object { $_.Name } | Select-Object -Unique)
+                        } catch {}
+                        if ($inst.Count -gt 0) {
+                            $state = 'Installed now: version ' + ((($inst | ForEach-Object { [string]$_.Version } | Select-Object -Unique)) -join ', ') + '.'
+                            if ($g.Count -lt 3) { $sev = 'info'; $state += ' A working copy is present, so nothing is broken; one update attempt failed and the Store retries on its own.' }
+                        } else { $state = 'Not currently installed.' }
+                        if ($users.Count -gt 0) { $state += ' Apps that depend on it: ' + (($users | Select-Object -First 8) -join ', ') + '.' }
+                        $fix = 'Open Microsoft Store > Downloads (or Library) > Get updates. If it fails again, restart the PC first so no app is holding the package open, then retry. Last resort: run wsreset.exe to clear the Store cache.'
+                    } elseif ($title -match '(KB\d{6,})') {
+                        $what = 'A Windows update (' + $Matches[1] + '). The linked Microsoft article describes what it contains.'
+                        $link = 'https://support.microsoft.com/help/' + ($Matches[1] -replace 'KB', '')
+                        $fix += ' If it still fails: DISM /Online /Cleanup-Image /RestoreHealth, restart, retry.'
+                    } elseif ($title -match 'Security Intelligence|Defender') {
+                        $what = 'A Microsoft Defender definition update. These are replaced several times a day, so a single failure is superseded by the next one.'
+                        $sev = 'info'
+                    } elseif ($title -match ' - \w[\w ]* - |Driver') {
+                        $what = 'A driver delivered by Windows Update for hardware that is present.'
+                        $fix = 'Install the device maker''s own driver instead (see the Drivers section); that normally stops Windows Update offering this one.'
+                    }
+                    $times = ('{0} time(s), last {1}' -f $g.Count, (Format-Stamp $f.Date))
+                    Add-Finding 'windows' $sev ('Update failed to install: {0}' -f (Get-Short $title 90)) `
+                        ('{0} Error {1}: {2} {3} Failed {4}.' -f $what, $hr, $errTxt, $state, $times) $fix $link
+                    [void]$frow.Add(@((Get-Short $title 90), $what, ('{0} - {1}' -f $hr, $errTxt), $times, $state))
                 }
+                Add-Table 'windows' 'Failed updates explained' @('Update', 'What it is', 'Error', 'How often', 'State now') $frow '' $false
                 if ($stale.Count -gt 0) {
                     Add-Finding 'windows' 'info' ('{0} failed driver update(s) were for hardware that is no longer installed' -f $stale.Count) `
                         ('{0}. The failure itself does not matter because the device is gone. Windows Update tried it because driver packages or software for the old device are still on the system.' -f (($stale | ForEach-Object { Get-Short ([string]$_.Title) 80 } | Select-Object -Unique) -join '; ')) `
