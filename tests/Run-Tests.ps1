@@ -234,5 +234,47 @@ $two = Get-BoardDriverLatest @(
 Check 'two named chips stay separate' @($two).Count 2
 Check 'ambiguous device is not guessed' (@($two | ForEach-Object { Find-BoardDriverMatch $_ $pc }).Count) 0
 
+# ---- regression: no blue-screen records at all (this emptied the Crashes section on a real PC)
+Check 'nearest record with no records does not throw' ($null -eq (Select-NearestRecord $null $t0 @{} 2 30)) $true
+Check 'nearest record with empty list' ($null -eq (Select-NearestRecord @() $t0 @{} 2 30)) $true
+
+# ---- power losses
+$alive = [datetime]'2026-11-10 23:30:00'; $boot = [datetime]'2026-11-10 09:00:00'
+Check 'state: in use' (Get-PowerLossState $alive $boot @() @() @()) 'in-use'
+Check 'state: asleep' (Get-PowerLossState $alive $boot @($alive.AddMinutes(-1)) @() @()) 'asleep'
+Check 'state: woke again after sleeping is in use' (Get-PowerLossState $alive $boot @($alive.AddHours(-5)) @($alive.AddHours(-4)) @()) 'in-use'
+Check 'state: slept, woke, slept again' (Get-PowerLossState $alive $boot @($alive.AddHours(-5), $alive.AddMinutes(-2)) @($alive.AddHours(-4)) @()) 'asleep'
+Check 'state: sleep from an earlier session is ignored' (Get-PowerLossState $alive $boot @($boot.AddHours(-3)) @() @()) 'in-use'
+Check 'state: shutting down' (Get-PowerLossState $alive $boot @() @() @($alive.AddMinutes(-1))) 'shutting-down'
+Check 'state: old shutdown request ignored' (Get-PowerLossState $alive $boot @() @() @($alive.AddHours(-2))) 'in-use'
+Check 'state: starting up' (Get-PowerLossState $boot.AddMinutes(2) $boot @() @() @()) 'starting-up'
+Check 'state: unknown session start is in use' (Get-PowerLossState $alive $null @() @() @()) 'in-use'
+Check 'state: empty lists passed as null' (Get-PowerLossState $alive $boot $null $null $null) 'in-use'
+Check 'duration minutes' (Format-Duration 12) '12 min'
+Check 'duration hours' (Format-Duration 200) '3 h 20 min'
+Check 'duration days' (Format-Duration 3000) '2 d 2 h'
+Check 'description names no component' ((Get-PowerLossDescription 'asleep')[1] -match 'PSU|power supply') $false
+
+# a component is only named when the report holds evidence for it
+$s1 = Get-PowerLossSummary @('asleep', 'asleep', 'shutting-down') $false 0 0 $false
+Check 'asleep only: informational' $s1.Sev 'info'
+Check 'asleep only: PSU not suspected' ($s1.PsuTitle -match 'suspect') $false
+Check 'asleep only: PSU informational' $s1.PsuSev 'info'
+$s2 = Get-PowerLossSummary @('in-use', 'in-use', 'in-use', 'asleep') $false 0 0 $false
+Check 'in use x3: critical in Crashes' $s2.Sev 'crit'
+Check 'in use, no evidence: PSU NOT named a suspect' ($s2.PsuTitle -match 'credible suspect') $false
+Check 'in use, no evidence: PSU section is not a warning' $s2.PsuSev 'info'
+Check 'in use, no evidence: says no component is named' ($s2.Detail -match 'no evidence pointing at any one component') $true
+Check 'in use, no sensors: action says get sensors working' ($s2.Action -match 'get the sensors working') $true
+Check 'in use: counts only running losses in the title' ($s2.Title -match '^3 unexpected') $true
+$s3 = Get-PowerLossSummary @('in-use') $true 0 0 $true
+Check 'in use + rail evidence: PSU named' ($s3.PsuTitle -match 'credible suspect') $true
+Check 'in use + rail evidence: PSU warning' $s3.PsuSev 'warn'
+Check 'one loss in use: warning not critical' $s3.Sev 'warn'
+$s4 = Get-PowerLossSummary @('in-use', 'in-use') $false 2 0 $true
+Check 'hardware errors named, PSU not' (($s4.Detail -match 'CPU or memory') -and -not ($s4.PsuTitle -match 'credible suspect')) $true
+$s5 = Get-PowerLossSummary @('asleep') $true 0 0 $true
+Check 'rail evidence but only asleep losses: PSU not tied to them' ($s5.PsuTitle -match 'credible suspect') $false
+
 Write-Host ('{0} passed, {1} failed' -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $script:Fail

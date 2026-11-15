@@ -155,8 +155,10 @@ function Register-QueryFailure([string]$what, $err) {
     $script:StepFailures++
     [void]$script:Errors.Add(('{0} could not be read: {1}' -f $what, (Get-Short ([string]$err.Exception.Message) 160)))
 }
-function Get-Ev([string]$log, [string]$provider, [int[]]$ids) {
+# $from: look back further than the normal window (used to find the boot that began a session)
+function Get-Ev([string]$log, [string]$provider, [int[]]$ids, $from) {
     $f = @{ LogName = $log; StartTime = $Since }
+    if ($from) { $f.StartTime = [datetime]$from }
     if ($provider) { $f.ProviderName = $provider }
     if ($ids) { $f.Id = $ids }
     try { return @(Get-WinEvent -FilterHashtable $f -MaxEvents 500 -ErrorAction Stop) }
@@ -729,19 +731,14 @@ Invoke-Step 'Power supply' {
     }
 
     $kp = Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(41)
-    $noBugcheck = 0
-    foreach ($e in $kp) { try { if ([int64]$e.Properties[0].Value -eq 0) { $noBugcheck++ } } catch {} }
     $dirty = Get-Ev 'System' 'EventLog' @(6008)
     Add-Fact 'psu' 'Unexpected shutdowns (event 6008)' $dirty.Count
     Add-Fact 'psu' 'Kernel-Power 41 events' $kp.Count
-    if ($kp.Count -gt 0) {
-        $sev = 'warn'; if ($noBugcheck -ge 5) { $sev = 'crit' }
-        Add-Finding 'psu' $sev ('System lost power or reset without shutting down {0} time(s)' -f $kp.Count) `
-            ('{0} of these had no bugcheck code, meaning Windows did not crash first: power simply went away or the machine was reset. Most recent: {1}. Holding the power button, a power cut or a hard freeze cause the same event.' -f $noBugcheck, (Format-Stamp $kp[0].TimeCreated)) `
-            'If you did not cause these yourself and they happen under load (gaming, rendering), the PSU or its cabling is the first suspect, then GPU and motherboard.' ''
-    } else {
+    if ($kp.Count -eq 0) {
         Add-Finding 'psu' 'ok' 'No unexpected power-loss events logged' ('Nothing in the last {0} days.' -f $Days) '' ''
     }
+    # When there ARE power losses, the Crashes step works out what the PC was doing each time and reports
+    # back here. The power supply is named as a suspect only if this report holds evidence for it.
 
     foreach ($b in (Get-Cim 'Win32_Battery')) {
         $full = (Get-Cim 'BatteryFullChargedCapacity' 'root\wmi' '' -Optional | Select-Object -First 1).FullChargedCapacity
@@ -1078,21 +1075,30 @@ Invoke-Step 'Crash analysis' {
     }
     $kp = Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(41)
     $bc = Get-Ev 'System' 'Microsoft-Windows-WER-SystemErrorReporting' @(1001)
-    $boots = Get-Ev 'System' 'Microsoft-Windows-Kernel-General' @(12)
+    $back = $Since.AddDays(-60)      # the session that ended in the oldest event may have begun before the window
+    $boots = Get-Ev 'System' 'Microsoft-Windows-Kernel-General' @(12) $back
+    $sleeps = @(Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(42, 506) $back | ForEach-Object { $_.TimeCreated })
+    $wakes = @(@(Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(107, 507) $back) + @(Get-Ev 'System' 'Microsoft-Windows-Power-Troubleshooter' @(1) $back) | ForEach-Object { $_.TimeCreated })
+    $shutdowns = @(@(Get-Ev 'System' 'User32' @(1074) $back) + @(Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(109) $back) | ForEach-Object { $_.TimeCreated })
     $tdr = Get-Ev 'System' 'Display' @(4101)
     $diskEv = @(Get-Ev 'System' 'disk' @(7, 11, 51, 52, 153)) + @(Get-Ev 'System' 'stornvme' @(11))
     $throttle = Get-Ev 'System' 'Microsoft-Windows-Kernel-Processor-Power' @(37)
 
     $rows = New-Rows
-    $codes = @(); $areasHit = @(); $usedBc = @{}
+    $codes = @(); $areasHit = @(); $usedBc = @{}; $states = @(); $nHw = 0; $nGpu = 0
     foreach ($e in ($kp | Sort-Object TimeCreated)) {
         $T = $e.TimeCreated
         $code = 0; try { $code = [int64]$e.Properties[0].Value } catch {}
-        # Event 41 is written at the NEXT boot. Find the last thing logged before that boot to date the crash itself.
+        # Event 41 is written at the NEXT boot. Find the last thing logged before that boot to date the event itself.
         $boot = $boots | Where-Object { $_.TimeCreated -le $T -and $_.TimeCreated -ge $T.AddMinutes(-10) } | Sort-Object TimeCreated | Select-Object -First 1
         $bootStart = $T.AddMinutes(-1); if ($boot) { $bootStart = $boot.TimeCreated }
         $alive = $bootStart
         try { $last = Get-WinEvent -FilterHashtable @{ LogName = 'System'; EndTime = $bootStart.AddSeconds(-2) } -MaxEvents 1 -ErrorAction Stop; if ($last) { $alive = $last.TimeCreated } } catch {}
+        # the boot that began the session which ended here
+        $session = $boots | Where-Object { $_.TimeCreated -le $alive -and $_.TimeCreated -lt $bootStart } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+        $sessionStart = $null; $ranFor = 'not known'
+        if ($session) { $sessionStart = $session.TimeCreated; $ranFor = Format-Duration ($alive - $sessionStart).TotalMinutes }
+        $offFor = Format-Duration ($bootStart - $alive).TotalMinutes
 
         $dumpEv = Select-NearestRecord $bc $T $usedBc 2 30
         $dump = ''
@@ -1117,44 +1123,55 @@ Invoke-Step 'Crash analysis' {
             $type = New-Cell 'Blue screen' 'crit' ''
             $codeTxt = ('0x{0:X} {1}' -f $code, $info[0]); $suspect = $info[1]; $cause = $info[2]
             if ($w.Count -gt 0 -and $suspect -notmatch 'Hardware|CPU') { $cause += ' Hardware error records were logged around this crash, which shifts suspicion toward hardware.' }
+            $codes += $code; $areasHit += $suspect
         } else {
-            $type = New-Cell 'Power loss or hard freeze' 'warn' ''
-            $codeTxt = 'none recorded'
-            if ($w.Count -gt 0) { $suspect = 'Hardware'; $cause = 'No blue screen, but the CPU logged a hardware error: the machine reset itself on a fatal fault. CPU stability (overclock, undervolt, memory profile), cooling, PSU or motherboard.' }
-            elseif ($g.Count -gt 0) { $suspect = 'GPU'; $cause = 'The graphics driver was resetting shortly before the machine froze or lost power. Graphics driver, GPU, or the PSU sagging under GPU load.' }
-            elseif ($d.Count -gt 0) { $suspect = 'Storage'; $cause = 'Disk errors preceded a freeze. If the system drive stalls, Windows cannot even write a crash record.' }
-            else { $suspect = 'Power or freeze'; $cause = 'Windows stopped without recording anything, so it was not a software crash it could catch. Power cut, PSU protection tripping, thermal shutdown, motherboard fault, or the power button being held.' }
+            # No crash record. Say what the PC was doing, and name a suspect only where an event supports it.
+            $state = Get-PowerLossState $alive $sessionStart $sleeps $wakes $shutdowns
+            $states += $state
+            $pd = Get-PowerLossDescription $state
+            $running = $state -in 'in-use', 'starting-up'
+            $type = New-Cell $pd[0] $(if ($running) { 'warn' } else { 'info' }) ''
+            $codeTxt = 'none recorded'; $suspect = 'None indicated'; $cause = $pd[1]
+            if ($running) {
+                if ($w.Count -gt 0) { $nHw++; $suspect = 'CPU, memory or motherboard'; $cause += ' Here the CPU also logged a hardware error, so the machine most likely reset itself on a fatal fault.' }
+                elseif ($g.Count -gt 0) { $nGpu++; $suspect = 'Graphics card or its driver'; $cause += ' Here the graphics driver was resetting shortly beforehand.' }
+                elseif ($d.Count -gt 0) { $suspect = 'Storage'; $cause += ' Here disk errors were logged shortly beforehand; if the system drive stalls, Windows cannot write a crash record.' }
+                elseif ($th.Count -gt 0) { $suspect = 'Cooling'; $cause += ' Here the CPU was being throttled beforehand, which is consistent with overheating.' }
+            }
         }
-        $codes += $code; $areasHit += $suspect
-        [void]$rows.Add(@((Format-Stamp $alive), $type, $codeTxt, $suspect, $cause, ($ev -join '; '), $dump))
+        [void]$rows.Add(@((Format-Stamp $alive), $ranFor, $offFor, $type, $codeTxt, $suspect, $cause, ($ev -join '; '), $dump))
     }
-    foreach ($b in ($bc | Where-Object { -not $usedBc.ContainsKey($_.RecordId) })) {
+    foreach ($b in ($bc | Where-Object { $null -ne $_ -and -not $usedBc.ContainsKey($_.RecordId) })) {
         $code = 0; if ($b.Message -match '0x([0-9a-fA-F]{8})') { $code = [Convert]::ToInt64($Matches[1], 16) }
         $info = Resolve-Bugcheck $code
         $codes += $code; $areasHit += $info[1]
-        [void]$rows.Add(@((Format-Stamp $b.TimeCreated), (New-Cell 'Blue screen' 'crit' ''), ('0x{0:X} {1}' -f $code, $info[0]), $info[1], $info[2], '', ''))
+        [void]$rows.Add(@((Format-Stamp $b.TimeCreated), '', '', (New-Cell 'Blue screen' 'crit' ''), ('0x{0:X} {1}' -f $code, $info[0]), $info[1], $info[2], '', ''))
     }
-    Add-Table 'crash' 'Crash timeline' @('Last sign of life', 'What happened', 'Bugcheck code', 'Prime suspect', 'What it means', 'Evidence around it', 'Dump file') $rows `
-        'Times are the last event Windows logged before the crash, so they are accurate to within a few minutes.' $false
+    Add-Table 'crash' 'Timeline of crashes and unexpected power losses' @('Last sign of life', 'Had been running', 'Off for', 'What happened', 'Bugcheck code', 'Suspect', 'What it means', 'Evidence around it', 'Dump file') $rows `
+        '"Last sign of life" is the last event Windows logged before it stopped, accurate to a few minutes. "Off for" runs from then until the PC was next started, so it includes any time spent asleep. "Suspect" names a component only where a logged event supports it; "None indicated" means the logs do not point anywhere.' $false
 
     if ($rows.Count -eq 0) {
         Add-Finding 'crash' 'ok' 'No system crashes or unexpected shutdowns' ('Nothing in the last {0} days. Re-run with -Days 90 to look further back.' -f $Days) '' ''
-    } else {
-        $sev = 'warn'; if ($rows.Count -ge 3) { $sev = 'crit' }
-        $distinct = @($codes | Where-Object { $_ -ne 0 } | Select-Object -Unique)
-        $noCode = @($codes | Where-Object { $_ -eq 0 }).Count
+    }
+    if ($codes.Count -gt 0) {
+        $sev = 'warn'; if ($codes.Count -ge 3) { $sev = 'crit' }
+        $distinct = @($codes | Select-Object -Unique)
         $top = ($areasHit | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
-        if ($distinct.Count -eq 0) {
-            $pattern = 'None of them left a bugcheck code. Windows was not given the chance to record anything, which puts the cause below the operating system: power delivery, thermal protection or the motherboard. Drivers are an unlikely cause of this pattern.'
-            $act = 'Note what the PC was doing each time. If it is always under GPU load, suspect the PSU and its cables first. Check the wall socket or extension lead, and watch temperatures under load.'
-        } elseif ($distinct.Count -eq 1 -and $noCode -eq 0) {
-            $pattern = 'Every crash has the same bugcheck code, which points at a single repeatable cause rather than general instability.'
+        if ($distinct.Count -eq 1) {
+            $pattern = 'Every blue screen has the same bugcheck code, which points at a single repeatable cause rather than general instability.'
             $act = 'Follow the "What it means" column, and get the faulting driver name from the dump (see below).'
         } else {
-            $pattern = 'The crashes do not share one code. A different failure each time is the signature of unstable hardware (memory, CPU settings, power) rather than one bad driver, because a bad driver tends to fail the same way.'
+            $pattern = 'The blue screens do not share one code. A different failure each time is the signature of unstable hardware (memory, CPU settings, power) rather than one bad driver, because a bad driver tends to fail the same way.'
             $act = 'Return the BIOS to defaults (XMP/EXPO, PBO, Curve Optimizer and overclocks off) and see whether the crashes stop. If they do, re-enable one setting at a time.'
         }
-        Add-Finding 'crash' $sev ('{0} crash(es) or unexpected shutdown(s); most often pointing at: {1}' -f $rows.Count, $top) $pattern $act ''
+        Add-Finding 'crash' $sev ('{0} blue-screen crash(es); most often pointing at: {1}' -f $codes.Count, $top) $pattern $act ''
+    }
+    if ($states.Count -gt 0) {
+        $railEvidence = @($script:Areas['psu'].findings | Where-Object { $_.sev -in 'warn', 'crit' -and $_.title -match 'rail' }).Count -gt 0
+        $railsReadable = @(Get-Sens 'SuperIO|Motherboard|EmbeddedController' 'Voltage' | Where-Object { (Get-RailNominal $_.Name) -gt 0 }).Count -gt 0
+        $sum = Get-PowerLossSummary $states $railEvidence $nHw $nGpu $railsReadable
+        Add-Finding 'crash' $sum.Sev $sum.Title $sum.Detail $sum.Action ''
+        Add-Finding 'psu' $sum.PsuSev $sum.PsuTitle $sum.PsuDetail '' ''
     }
 
     # ---- name the faulting driver from the minidumps, if the Windows debugger is installed

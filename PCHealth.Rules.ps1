@@ -179,7 +179,7 @@ function Select-DriveSensors($sensors, [string]$name, $diskNumber) {
 # The record closest in time to $t (within the window) that has not already been claimed by another crash.
 function Select-NearestRecord($records, [datetime]$t, [hashtable]$used, [double]$minutesBefore, [double]$minutesAfter) {
     return ($records |
-        Where-Object { -not $used.ContainsKey($_.RecordId) -and $_.TimeCreated -ge $t.AddMinutes(-1 * $minutesBefore) -and $_.TimeCreated -le $t.AddMinutes($minutesAfter) } |
+        Where-Object { $null -ne $_ -and -not $used.ContainsKey($_.RecordId) -and $_.TimeCreated -ge $t.AddMinutes(-1 * $minutesBefore) -and $_.TimeCreated -le $t.AddMinutes($minutesAfter) } |
         Sort-Object { [math]::Abs(($_.TimeCreated - $t).TotalSeconds) } | Select-Object -First 1)
 }
 
@@ -380,4 +380,94 @@ function Find-BoardDriverMatch($group, $drivers) {
     }
     if ($group.Sole) { return $cand }
     return @()
+}
+
+# ------------------------------------------------------------------------------------------------
+# Unexpected power losses (Windows stopped with no crash record)
+
+function Format-Duration([double]$minutes) {
+    if ($minutes -lt 0) { return '' }
+    if ($minutes -lt 1) { return 'under 1 min' }
+    if ($minutes -lt 60) { return ('{0:N0} min' -f $minutes) }
+    if ($minutes -lt 1440) { return ('{0:N0} h {1:N0} min' -f [math]::Floor($minutes / 60), ($minutes % 60)) }
+    return ('{0:N0} d {1:N0} h' -f [math]::Floor($minutes / 1440), [math]::Floor(($minutes % 1440) / 60))
+}
+
+# What the PC was doing when it stopped, from the events logged before the last sign of life.
+#   asleep        - it had gone to sleep or hibernated and had not woken
+#   shutting-down - a shutdown or restart had been requested
+#   starting-up   - it had been running for under three minutes
+#   in-use        - none of the above
+# $sessionStart may be $null when the boot that began the session is older than the log window.
+function Get-PowerLossState([datetime]$lastAlive, $sessionStart, $sleeps, $wakes, $shutdowns) {
+    $from = $lastAlive.AddDays(-30); if ($sessionStart) { $from = [datetime]$sessionStart }
+    $to = $lastAlive.AddMinutes(1)
+    $lastSleep = @($sleeps | Where-Object { $null -ne $_ -and $_ -ge $from -and $_ -le $to } | Sort-Object -Descending) | Select-Object -First 1
+    $lastWake = @($wakes | Where-Object { $null -ne $_ -and $_ -ge $from -and $_ -le $to } | Sort-Object -Descending) | Select-Object -First 1
+    if ($lastSleep -and (-not $lastWake -or $lastSleep -gt $lastWake)) { return 'asleep' }
+    if (@($shutdowns | Where-Object { $null -ne $_ -and $_ -ge $lastAlive.AddMinutes(-10) -and $_ -le $to }).Count -gt 0) { return 'shutting-down' }
+    if ($sessionStart -and ($lastAlive - [datetime]$sessionStart).TotalMinutes -lt 3) { return 'starting-up' }
+    return 'in-use'
+}
+
+# Returns @(short label, what it means). Deliberately names no component: on their own these events are
+# not evidence against any particular part.
+function Get-PowerLossDescription([string]$state) {
+    switch ($state) {
+        'asleep' { return @('Power lost while asleep', 'The PC had gone to sleep and never woke. Either mains power was removed while it slept (switched off at the wall, a power cut) or it failed to wake and was powered off by hand. This is not evidence of a fault during use.') }
+        'shutting-down' { return @('Power lost during shutdown', 'A shutdown or restart had started but did not finish. Typically a shutdown that hung and was ended with the power button, or power switched off at the wall before Windows had finished.') }
+        'starting-up' { return @('Power lost during start-up', 'The PC stopped within three minutes of starting. A failed or interrupted boot.') }
+    }
+    return @('Power lost while in use', 'Windows stopped without recording anything while the PC was running. The logs cannot tell apart a mains cut, the reset or power button, a hard freeze, a thermal shutdown and a power-supply fault.')
+}
+
+# Overall reading of the power losses. A component is named as a suspect ONLY when this report holds
+# evidence for it: out-of-tolerance voltage readings for the PSU, hardware error records for the
+# CPU / memory / board, graphics driver resets for the GPU.
+# Returns a hashtable: Sev, Title, Detail, Action for the Crashes section; PsuSev, PsuTitle, PsuDetail
+# for the Power supply section.
+function Get-PowerLossSummary($states, [bool]$railEvidence, [int]$withHardwareErrors, [int]$withGpuResets, [bool]$railsReadable) {
+    $n = @($states).Count
+    $inUse = @($states | Where-Object { $_ -eq 'in-use' }).Count
+    $asleep = @($states | Where-Object { $_ -eq 'asleep' }).Count
+    $shut = @($states | Where-Object { $_ -eq 'shutting-down' }).Count
+    $start = @($states | Where-Object { $_ -eq 'starting-up' }).Count
+    $parts = @()
+    if ($inUse) { $parts += ('{0} while in use' -f $inUse) }
+    if ($asleep) { $parts += ('{0} while asleep' -f $asleep) }
+    if ($shut) { $parts += ('{0} during shutdown' -f $shut) }
+    if ($start) { $parts += ('{0} during start-up' -f $start) }
+    $breakdown = $parts -join ', '
+    $r = @{}
+    if ($inUse -eq 0 -and $start -eq 0) {
+        $r.Sev = 'info'
+        $r.Title = ('{0} unexpected power loss(es), none while the PC was in use' -f $n)
+        $r.Detail = ('Breakdown: {0}. This pattern is what switching the PC off at the wall, a power cut, or powering off by hand after a failed wake or a hung shutdown looks like. Nothing here indicates a hardware fault during use.' -f $breakdown)
+        $r.Action = 'If nobody is switching it off at the mains, the thing to look at is sleep and shutdown rather than hardware: update the chipset and graphics drivers and try turning off Fast Startup.'
+        $r.PsuSev = 'info'
+        $r.PsuTitle = ('{0} unexpected power loss(es) recorded, none while the PC was in use' -f $n)
+        $r.PsuDetail = 'See the Crashes section for the timeline. Losses while asleep or shutting down are not evidence against the power supply.'
+        return $r
+    }
+    $bad = $inUse + $start
+    $r.Sev = 'warn'; if ($bad -ge 3) { $r.Sev = 'crit' }
+    $r.Title = ('{0} unexpected power loss(es) while the PC was running (of {1} in total)' -f $bad, $n)
+    $evidence = @()
+    if ($railEvidence) { $evidence += 'Voltage readings in this report are outside tolerance, which makes the power supply a credible suspect.' }
+    if ($withHardwareErrors -gt 0) { $evidence += ('{0} of them are accompanied by hardware error records, which point at CPU or memory stability or the motherboard.' -f $withHardwareErrors) }
+    if ($withGpuResets -gt 0) { $evidence += ('{0} of them followed graphics driver resets, which point at the graphics card, its driver or its power feed.' -f $withGpuResets) }
+    if ($evidence.Count -eq 0) { $evidence += 'This report holds no evidence pointing at any one component, so none is named.' }
+    $r.Detail = ('Breakdown: {0}. Windows recorded nothing at the moment of failure, so the logs alone cannot tell a mains cut, the power or reset button, a hard freeze, a thermal shutdown and a power-supply fault apart. {1}' -f $breakdown, ($evidence -join ' '))
+    if ($railsReadable) { $r.Action = 'Note what the PC was doing each time (the timeline shows when). Then run watch mode during that activity: it records voltage rails, temperatures and power draw while you use the PC, which is the evidence that separates these causes.' }
+    else { $r.Action = 'Note what the PC was doing each time (the timeline shows when). This report has no temperature or voltage readings, which is the evidence that would separate these causes: get the sensors working (see the Motherboard section), then run watch mode during that activity.' }
+    if ($railEvidence) {
+        $r.PsuSev = 'warn'
+        $r.PsuTitle = ('The power supply is a credible suspect for {0} power loss(es) while running' -f $bad)
+        $r.PsuDetail = 'Two things line up: the PC lost power while running with no crash record, and voltage readings in this report are outside tolerance. Confirm the readings in the BIOS before replacing anything.'
+    } else {
+        $r.PsuSev = 'info'
+        $r.PsuTitle = ('{0} power loss(es) while running: nothing in this report ties them to the power supply' -f $bad)
+        $r.PsuDetail = 'A power-supply fault is one possible cause among several and can be neither confirmed nor ruled out here. It would take voltage readings outside tolerance, or a 12 V rail that sags under load in watch mode, to make it a suspect.'
+    }
+    return $r
 }

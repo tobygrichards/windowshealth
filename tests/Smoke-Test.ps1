@@ -64,7 +64,34 @@ function global:Get-CimInstance {
         default { if ($ErrorAction -eq 'Stop' -and $ClassName -match 'Battery|FailurePredict|AntiVirus') { throw 'Invalid class' } }
     }
 }
-function global:Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) Write-Error -Message 'No events were found' -ErrorId 'NoMatchingEventsFound' -ErrorAction Stop }
+# A small event log: three sessions, each ending without a clean shutdown and with NO blue-screen record.
+#   1. lost power while in use   2. lost power while asleep   3. lost power during a requested shutdown
+function New-FakeEvent($provider, $id, [datetime]$time, $value) {
+    [pscustomobject]@{ ProviderName = $provider; Id = $id; TimeCreated = $time; RecordId = [int64]($time.Ticks % 1000000007); Level = 4; Message = "event $id"; Properties = @([pscustomobject]@{ Value = $value }) }
+}
+$d0 = (Get-Date).Date.AddDays(-10)
+$KG = 'Microsoft-Windows-Kernel-General'; $KP = 'Microsoft-Windows-Kernel-Power'
+$global:FakeEvents = @(
+    (New-FakeEvent $KG 12 $d0.AddHours(9) 0),                              # session 1 starts
+    (New-FakeEvent 'Service Control Manager' 7036 $d0.AddHours(14) 0),      # last sign of life, in use
+    (New-FakeEvent $KG 12 $d0.AddHours(14).AddMinutes(2) 0),                # back on 2 minutes later
+    (New-FakeEvent $KP 41 $d0.AddHours(14).AddMinutes(2).AddSeconds(20) 0),
+    (New-FakeEvent $KP 42 $d0.AddHours(23) 0),                              # session 2 goes to sleep
+    (New-FakeEvent $KG 12 $d0.AddDays(1).AddHours(8) 0),                    # started cold next morning
+    (New-FakeEvent $KP 41 $d0.AddDays(1).AddHours(8).AddSeconds(20) 0),
+    (New-FakeEvent 'User32' 1074 $d0.AddDays(1).AddHours(22) 0),            # session 3: shutdown requested
+    (New-FakeEvent $KG 12 $d0.AddDays(2).AddHours(9) 0),
+    (New-FakeEvent $KP 41 $d0.AddDays(2).AddHours(9).AddSeconds(20) 0))
+function global:Get-WinEvent {
+    param($FilterHashtable, $MaxEvents, $ErrorAction)
+    $f = $FilterHashtable
+    $r = @($global:FakeEvents | Where-Object {
+            (-not $f.ProviderName -or $_.ProviderName -eq $f.ProviderName) -and (-not $f.Id -or $_.Id -in $f.Id) -and
+            (-not $f.StartTime -or $_.TimeCreated -ge $f.StartTime) -and (-not $f.EndTime -or $_.TimeCreated -le $f.EndTime) } | Sort-Object TimeCreated -Descending)
+    if ($MaxEvents) { $r = @($r | Select-Object -First $MaxEvents) }
+    if ($r.Count -eq 0) { Write-Error -Message 'No events were found' -ErrorId 'NoMatchingEventsFound' -ErrorAction Stop }
+    $r
+}
 function global:Get-PhysicalDisk {
     [pscustomobject]@{ FriendlyName = 'Samsung SSD 990 PRO 1TB'; DeviceId = '0'; MediaType = 'SSD'; BusType = 'NVMe'; Size = 1TB; HealthStatus = 'Healthy'; OperationalStatus = 'OK'; FirmwareVersion = '4B2QJXD7' }
     [pscustomobject]@{ FriendlyName = 'Samsung SSD 990 PRO 1TB'; DeviceId = '2'; MediaType = 'SSD'; BusType = 'NVMe'; Size = 1TB; HealthStatus = 'Healthy'; OperationalStatus = 'OK'; FirmwareVersion = '4B2QJXD7' }
@@ -112,7 +139,14 @@ Expect 'twin drive 0 shows its own data written' ($drv.rows[0][6] -eq '4.1 TB')
 Expect 'twin drive 2 shows its own data written' ($drv.rows[1][6] -eq '550.0 TB')
 Expect 'worn twin drive flagged' (Has 'drives' 'crit' '93 % of its rated write endurance')
 Expect 'hard disk has no life-used figure' ($drv.rows[2][5] -eq 'n/a (HDD)')
-Expect 'no crashes reported as ok when log query succeeded' (Has 'crash' 'ok' 'No system crashes')
+$tl = (Area 'crash').tables | Where-Object { $_.title -match '^Timeline' }
+Expect 'crash section is populated when there are power losses but no blue screens' (@($tl.rows).Count -eq 3)
+Expect 'timeline: first loss was while in use, after 5 h' (($tl.rows[0][3].t -eq 'Power lost while in use') -and ($tl.rows[0][1] -eq '5 h 0 min') -and ($tl.rows[0][2] -eq '2 min'))
+Expect 'timeline: second loss was while asleep' ($tl.rows[1][3].t -eq 'Power lost while asleep')
+Expect 'timeline: third loss was during shutdown' ($tl.rows[2][3].t -eq 'Power lost during shutdown')
+Expect 'timeline: no suspect named without a supporting event' (@($tl.rows | Where-Object { $_[5] -ne 'None indicated' }).Count -eq 0)
+Expect 'crash finding counts only the loss while running' (Has 'crash' 'warn' '^1 unexpected power loss\(es\) while the PC was running \(of 3')
+Expect 'PSU named a suspect because this simulated PC has an out-of-tolerance rail' (Has 'psu' 'warn' 'credible suspect')
 Expect 'chipset package missing flagged' (Has 'drivers' 'warn' 'chipset driver package is not installed')
 Expect 'overall is critical' ($r.meta.overall -eq 'crit')
 $vs = (Area 'drivers').tables | Where-Object { $_.title -match '^Windows versus manufacturer' }
