@@ -1,0 +1,60 @@
+# PC Health Check
+
+A passive health check for a Windows 10/11 PC. It reads evidence that already
+exists on the machine and writes an HTML dashboard. It never runs a stress
+test, benchmark or surface scan, so it adds no wear to any component.
+
+## Run it
+
+1. Copy this folder to the Windows PC.
+2. Double-click `Run-PCHealth.cmd` and accept the administrator prompt.
+3. The dashboard opens in your browser. Reports are kept in `reports\`
+   (HTML plus the raw JSON), so you can compare runs over time.
+
+`Run-PCHealth-DeepScan.cmd` additionally runs the read-only
+`DISM /ScanHealth` and `sfc /verifyonly` (10-20 minutes).
+
+Options for `Get-PCHealth.ps1`:
+
+| Switch | Effect |
+|---|---|
+| `-DeepScan` | Add the DISM and SFC verification |
+| `-NoSensors` | Do not load LibreHardwareMonitor (no kernel driver, no temperatures or voltages) |
+| `-Offline` | No network calls at all |
+| `-Days 90` | Event-log look-back window (default 30) |
+| `-OutDir`, `-NoOpen` | Report location; do not open the browser |
+
+## What it checks
+
+| Area | Evidence |
+|---|---|
+| CPU | Machine-check (WHEA) errors, firmware throttling events, temperature, microcode revision |
+| GPU | Driver crash/recovery (TDR) events, GPU watchdog dumps, device error codes, temperature |
+| Memory | WHEA memory errors, last Windows Memory Diagnostic result, rated versus running speed |
+| Drives | SMART / NVMe health log (life used, temperature, uncorrected errors), failure prediction, disk error events, free space |
+| Power supply | Voltage rails from the motherboard sensor chip against ATX tolerance, unexpected power-loss events, laptop battery wear |
+| Motherboard | PCIe/bus errors, BIOS age, CMOS battery voltage, Secure Boot, TPM |
+| Windows | Component store state, blue-screen history, pending and failed updates, pending restart, Defender, failed services |
+| Drivers | Inventory with age and signing, failed devices, live GPU driver version check, Windows Update downgrade offers, staged-versus-active driver mismatch, where to download each driver |
+
+## Things to know
+
+- **PSU and motherboard verdicts are inferred.** Most PSUs have no data link to
+  the PC, and a passive check cannot prove stability under load. A clean report
+  means "no evidence of a fault", not "proven good".
+- **Sensors use LibreHardwareMonitor**, downloaded from its GitHub releases on
+  first run into `lib\`. It loads a kernel driver while the scan runs and
+  unloads it afterwards. Some anti-cheat systems object to that driver, so do
+  not run the scan with a protected game open. Recent releases may also need
+  the separate PawnIO driver for CPU and motherboard sensors; the dashboard
+  says so if those readings are missing.
+- **The live GPU driver lookup uses the vendors' public web pages**, not an
+  official API. If a vendor changes its site the lookup reports a failure and
+  falls back to the driver's age and a download link.
+- **Windows Update search** can take a minute. Use `-Offline` to skip it.
+
+## Files
+
+- `Get-PCHealth.ps1` - the collector (pure ASCII, runs on Windows PowerShell 5.1 and PowerShell 7)
+- `dashboard.template.html` - the dashboard; the collector embeds the report data into a copy of it
+- `Run-PCHealth.cmd`, `Run-PCHealth-DeepScan.cmd` - launchers that bypass the script execution policy for this one run
