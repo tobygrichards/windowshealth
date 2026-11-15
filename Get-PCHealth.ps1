@@ -161,6 +161,7 @@ function Get-TempSev([double]$v, [double]$warn, [double]$crit) {
     return 'ok'
 }
 
+New-Area 'crash' 'Crashes'
 New-Area 'cpu' 'CPU'
 New-Area 'gpu' 'GPU'
 New-Area 'memory' 'Memory'
@@ -710,19 +711,6 @@ Invoke-Step 'Windows installation' {
         Add-Finding 'windows' 'info' 'System file integrity was not deep-scanned' 'This run only read the existing corruption flag, which is fast but only reflects problems Windows has already noticed.' 'Re-run with -DeepScan (Run-PCHealth-DeepScan.cmd) for a full read-only DISM and SFC verification.' ''
     }
 
-    $bc = Get-Ev 'System' 'Microsoft-Windows-WER-SystemErrorReporting' @(1001)
-    if ($bc.Count -gt 0) {
-        $sev = 'warn'; if ($bc.Count -ge 3) { $sev = 'crit' }
-        Add-Finding 'windows' $sev ('{0} blue-screen crash(es) in the last {1} days' -f $bc.Count, $Days) `
-            'The bugcheck codes are in the table below. The same code repeating points at one cause; different codes each time point at memory, CPU stability or power.' `
-            'Search the bugcheck code, or open the dumps in C:\Windows\Minidump with WinDbg (!analyze -v).' ''
-        $brow = New-Rows
-        foreach ($e in ($bc | Select-Object -First 15)) { [void]$brow.Add(@((Format-Stamp $e.TimeCreated), (Get-Short $e.Message 260))) }
-        Add-Table 'windows' 'Blue-screen history' @('When', 'Bugcheck') $brow '' $false
-    } else {
-        Add-Finding 'windows' 'ok' 'No blue-screen crashes logged' ('Nothing in the last {0} days.' -f $Days) '' ''
-    }
-
     try {
         $hf = @(Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending)
         if ($hf.Count -gt 0) {
@@ -785,7 +773,224 @@ Invoke-Step 'Windows installation' {
     }
 }
 
+# ----------------------------------------------------------- crash analysis
+# code = name, suspect area, plain-English meaning
+$script:Bugchecks = @{
+    0x124 = @('WHEA_UNCORRECTABLE_ERROR', 'Hardware', 'The CPU reported a fatal hardware error. Almost never software: an unstable overclock, undervolt or memory profile, overheating, or a failing CPU, PSU or motherboard.')
+    0x101 = @('CLOCK_WATCHDOG_TIMEOUT', 'CPU', 'A CPU core stopped responding. Typical of an unstable overclock, undervolt or Curve Optimizer setting; occasionally a failing CPU.')
+    0x116 = @('VIDEO_TDR_FAILURE', 'GPU', 'The graphics driver hung and could not be reset. Graphics driver, GPU overheating or instability, or insufficient power to the card.')
+    0x117 = @('VIDEO_TDR_TIMEOUT_DETECTED', 'GPU', 'The graphics driver took too long to respond.')
+    0x119 = @('VIDEO_SCHEDULER_INTERNAL_ERROR', 'GPU', 'The graphics scheduler hit a fatal error. Graphics driver or failing GPU.')
+    0x10E = @('VIDEO_MEMORY_MANAGEMENT_INTERNAL', 'GPU', 'Graphics memory manager error. Graphics driver or GPU memory.')
+    0x1A = @('MEMORY_MANAGEMENT', 'Memory', 'Windows found its memory bookkeeping corrupted. Faulty or unstable RAM (XMP/EXPO), less often a driver.')
+    0x4E = @('PFN_LIST_CORRUPT', 'Memory', 'Memory page list corrupted. Faulty or unstable RAM, or a driver writing where it should not.')
+    0x12B = @('FAULTY_HARDWARE_CORRUPTED_PAGE', 'Memory', 'A memory page changed when nothing should have touched it. Strongly suggests faulty RAM.')
+    0x50 = @('PAGE_FAULT_IN_NONPAGED_AREA', 'Driver or memory', 'Something referenced memory that does not exist. A buggy driver or faulty RAM.')
+    0x0A = @('IRQL_NOT_LESS_OR_EQUAL', 'Driver or memory', 'A driver touched memory at the wrong priority level. Buggy driver, or faulty RAM.')
+    0xD1 = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'Driver', 'A driver touched invalid memory. The dump normally names the driver; network and storage drivers are common.')
+    0x3B = @('SYSTEM_SERVICE_EXCEPTION', 'Driver', 'A system call crashed in kernel code. Usually a driver (graphics and antivirus are common).')
+    0x7E = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'Driver', 'A driver thread crashed. The dump normally names the driver.')
+    0x1E = @('KMODE_EXCEPTION_NOT_HANDLED', 'Driver or memory', 'Kernel code hit an error it did not handle. A driver, or faulty RAM.')
+    0x9F = @('DRIVER_POWER_STATE_FAILURE', 'Driver', 'A driver did not complete a sleep, wake or shutdown transition. Usually network, USB or graphics drivers.')
+    0x133 = @('DPC_WATCHDOG_VIOLATION', 'Driver or storage', 'A driver held the CPU too long. Storage controller or SSD firmware, or network and graphics drivers.')
+    0x139 = @('KERNEL_SECURITY_CHECK_FAILURE', 'Driver or memory', 'Kernel data structure corruption detected. A driver bug or faulty RAM.')
+    0xEF = @('CRITICAL_PROCESS_DIED', 'Windows or storage', 'A process Windows cannot run without died. Corrupt system files, or a failing system drive.')
+    0x7A = @('KERNEL_DATA_INPAGE_ERROR', 'Storage', 'Windows could not read its own data back from disk. Failing drive, cable or storage controller.')
+    0xF4 = @('CRITICAL_OBJECT_TERMINATION', 'Storage', 'A critical process ended, most often because the system drive stopped responding.')
+    0x7B = @('INACCESSIBLE_BOOT_DEVICE', 'Storage', 'Windows lost access to the boot drive. Storage driver, controller mode change or failing drive.')
+    0x154 = @('UNEXPECTED_STORE_EXCEPTION', 'Storage', 'The memory compression store failed, most often because the system drive stalled.')
+    0xC2 = @('BAD_POOL_CALLER', 'Driver', 'A driver made an invalid memory pool request.')
+    0x19 = @('BAD_POOL_HEADER', 'Driver or memory', 'Kernel memory pool corrupted. A driver, or faulty RAM.')
+}
+function Test-Near($ev, [datetime]$from, [datetime]$to) { return @($ev | Where-Object { $_.TimeCreated -ge $from -and $_.TimeCreated -le $to }) }
+
+Invoke-Step 'Crash analysis' {
+    $cc = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction SilentlyContinue
+    $modes = @{ 0 = 'None (disabled)'; 1 = 'Complete'; 2 = 'Kernel'; 3 = 'Small (minidump)'; 7 = 'Automatic' }
+    if ($cc) {
+        Add-Fact 'crash' 'Crash dump setting' $modes[[int]$cc.CrashDumpEnabled]
+        if ([int]$cc.CrashDumpEnabled -eq 0) {
+            Add-Finding 'crash' 'warn' 'Crash dumps are disabled' 'Windows is set to write no dump on a blue screen, so the driver at fault can never be identified afterwards.' `
+                'System Properties > Advanced > Startup and Recovery > Write debugging information: choose "Automatic memory dump" or "Small memory dump".' ''
+        }
+    }
+    $kp = Get-Ev 'System' 'Microsoft-Windows-Kernel-Power' @(41)
+    $bc = Get-Ev 'System' 'Microsoft-Windows-WER-SystemErrorReporting' @(1001)
+    $boots = Get-Ev 'System' 'Microsoft-Windows-Kernel-General' @(12)
+    $tdr = Get-Ev 'System' 'Display' @(4101)
+    $diskEv = @(Get-Ev 'System' 'disk' @(7, 11, 51, 52, 153)) + @(Get-Ev 'System' 'stornvme' @(11))
+    $throttle = Get-Ev 'System' 'Microsoft-Windows-Kernel-Processor-Power' @(37)
+
+    $rows = New-Rows
+    $codes = @(); $areasHit = @(); $usedBc = @{}
+    foreach ($e in $kp) {
+        $T = $e.TimeCreated
+        $code = 0; try { $code = [int64]$e.Properties[0].Value } catch {}
+        # Event 41 is written at the NEXT boot. Find the last thing logged before that boot to date the crash itself.
+        $boot = $boots | Where-Object { $_.TimeCreated -le $T -and $_.TimeCreated -ge $T.AddMinutes(-10) } | Sort-Object TimeCreated | Select-Object -First 1
+        $bootStart = $T.AddMinutes(-1); if ($boot) { $bootStart = $boot.TimeCreated }
+        $alive = $bootStart
+        try { $last = Get-WinEvent -FilterHashtable @{ LogName = 'System'; EndTime = $bootStart.AddSeconds(-2) } -MaxEvents 1 -ErrorAction Stop; if ($last) { $alive = $last.TimeCreated } } catch {}
+
+        $dumpEv = $bc | Where-Object { $_.TimeCreated -ge $T.AddMinutes(-2) -and $_.TimeCreated -le $T.AddMinutes(30) } | Select-Object -First 1
+        $dump = ''
+        if ($dumpEv) {
+            $usedBc[$dumpEv.RecordId] = 1
+            if ($dumpEv.Message -match '([A-Za-z]:\\[^\s"]+\.dmp)') { $dump = [IO.Path]::GetFileName($Matches[1]) }
+            if ($code -eq 0 -and $dumpEv.Message -match '0x([0-9a-fA-F]{8})') { $code = [Convert]::ToInt64($Matches[1], 16) }
+        }
+        $w = Test-Near $script:Whea $alive.AddMinutes(-15) $T.AddMinutes(10)
+        $g = Test-Near $tdr $alive.AddMinutes(-30) $alive.AddMinutes(1)
+        $d = Test-Near $diskEv $alive.AddMinutes(-30) $alive.AddMinutes(1)
+        $th = Test-Near $throttle $alive.AddMinutes(-30) $alive.AddMinutes(1)
+        $ev = @()
+        if ($w.Count -gt 0) { $ev += ('{0} hardware error (WHEA) record(s)' -f $w.Count) }
+        if ($g.Count -gt 0) { $ev += ('{0} graphics driver reset(s) in the 30 min before' -f $g.Count) }
+        if ($d.Count -gt 0) { $ev += ('{0} disk error(s) in the 30 min before' -f $d.Count) }
+        if ($th.Count -gt 0) { $ev += 'CPU was being throttled by firmware beforehand' }
+        if ($ev.Count -eq 0) { $ev += 'No related warnings logged beforehand' }
+
+        if ($code -ne 0) {
+            $k = $code; if ($k -ge 0x10000000 -and $k -lt 0x20000000) { $k = $k - 0x10000000 }
+            $info = $null; if ($k -le 0x7FFFFFFF) { $info = $script:Bugchecks[[int]$k] }
+            if (-not $info) { $info = @('(not in built-in table)', 'Unknown', 'Search this bugcheck code on Microsoft Learn for its meaning.') }
+            $type = New-Cell 'Blue screen' 'crit' ''
+            $codeTxt = ('0x{0:X} {1}' -f $code, $info[0]); $suspect = $info[1]; $cause = $info[2]
+            if ($w.Count -gt 0 -and $suspect -notmatch 'Hardware|CPU') { $cause += ' Hardware error records were logged around this crash, which shifts suspicion toward hardware.' }
+        } else {
+            $type = New-Cell 'Power loss or hard freeze' 'warn' ''
+            $codeTxt = 'none recorded'
+            if ($w.Count -gt 0) { $suspect = 'Hardware'; $cause = 'No blue screen, but the CPU logged a hardware error: the machine reset itself on a fatal fault. CPU stability (overclock, undervolt, memory profile), cooling, PSU or motherboard.' }
+            elseif ($g.Count -gt 0) { $suspect = 'GPU'; $cause = 'The graphics driver was resetting shortly before the machine froze or lost power. Graphics driver, GPU, or the PSU sagging under GPU load.' }
+            elseif ($d.Count -gt 0) { $suspect = 'Storage'; $cause = 'Disk errors preceded a freeze. If the system drive stalls, Windows cannot even write a crash record.' }
+            else { $suspect = 'Power or freeze'; $cause = 'Windows stopped without recording anything, so it was not a software crash it could catch. Power cut, PSU protection tripping, thermal shutdown, motherboard fault, or the power button being held.' }
+        }
+        $codes += $code; $areasHit += $suspect
+        [void]$rows.Add(@((Format-Stamp $alive), $type, $codeTxt, $suspect, $cause, ($ev -join '; '), $dump))
+    }
+    foreach ($b in ($bc | Where-Object { -not $usedBc.ContainsKey($_.RecordId) })) {
+        $code = 0; if ($b.Message -match '0x([0-9a-fA-F]{8})') { $code = [Convert]::ToInt64($Matches[1], 16) }
+        $info = $null; if ($code -le 0x7FFFFFFF) { $info = $script:Bugchecks[[int]$code] }
+        if (-not $info) { $info = @('', 'Unknown', (Get-Short $b.Message 200)) }
+        $codes += $code; $areasHit += $info[1]
+        [void]$rows.Add(@((Format-Stamp $b.TimeCreated), (New-Cell 'Blue screen' 'crit' ''), ('0x{0:X} {1}' -f $code, $info[0]), $info[1], $info[2], '', ''))
+    }
+    Add-Table 'crash' 'Crash timeline' @('Last sign of life', 'What happened', 'Bugcheck code', 'Prime suspect', 'What it means', 'Evidence around it', 'Dump file') $rows `
+        'Times are the last event Windows logged before the crash, so they are accurate to within a few minutes.' $false
+
+    if ($rows.Count -eq 0) {
+        Add-Finding 'crash' 'ok' 'No system crashes or unexpected shutdowns' ('Nothing in the last {0} days. Re-run with -Days 90 to look further back.' -f $Days) '' ''
+    } else {
+        $sev = 'warn'; if ($rows.Count -ge 3) { $sev = 'crit' }
+        $distinct = @($codes | Where-Object { $_ -ne 0 } | Select-Object -Unique)
+        $noCode = @($codes | Where-Object { $_ -eq 0 }).Count
+        $top = ($areasHit | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
+        if ($distinct.Count -eq 0) {
+            $pattern = 'None of them left a bugcheck code. Windows was not given the chance to record anything, which puts the cause below the operating system: power delivery, thermal protection or the motherboard. Drivers are an unlikely cause of this pattern.'
+            $act = 'Note what the PC was doing each time. If it is always under GPU load, suspect the PSU and its cables first. Check the wall socket or extension lead, and watch temperatures under load.'
+        } elseif ($distinct.Count -eq 1 -and $noCode -eq 0) {
+            $pattern = 'Every crash has the same bugcheck code, which points at a single repeatable cause rather than general instability.'
+            $act = 'Follow the "What it means" column, and get the faulting driver name from the dump (see below).'
+        } else {
+            $pattern = 'The crashes do not share one code. A different failure each time is the signature of unstable hardware (memory, CPU settings, power) rather than one bad driver, because a bad driver tends to fail the same way.'
+            $act = 'Return the BIOS to defaults (XMP/EXPO, PBO, Curve Optimizer and overclocks off) and see whether the crashes stop. If they do, re-enable one setting at a time.'
+        }
+        Add-Finding 'crash' $sev ('{0} crash(es) or unexpected shutdown(s); most often pointing at: {1}' -f $rows.Count, $top) $pattern $act ''
+    }
+
+    # ---- name the faulting driver from the minidumps, if the Windows debugger is installed
+    $dumps = @()
+    if (Test-Path "$env:SystemRoot\Minidump") { $dumps = @(Get-ChildItem "$env:SystemRoot\Minidump" -Filter '*.dmp' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending) }
+    Add-Fact 'crash' 'Minidumps on disk' $dumps.Count
+    $cdb = @("${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe", "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\cdb.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($dumps.Count -gt 0 -and $cdb -and -not $Offline) {
+        $drow = New-Rows
+        $sym = 'srv*{0}*https://msdl.microsoft.com/download/symbols' -f (Join-Path $env:TEMP 'pchealth-symbols')
+        foreach ($dmp in ($dumps | Select-Object -First 3)) {
+            Write-Host ('      analysing {0} (downloads symbols on first use)...' -f $dmp.Name)
+            $out = Join-Path $env:TEMP 'pchealth-cdb.txt'
+            $p = Start-Process -FilePath $cdb -ArgumentList @('-z', ('"{0}"' -f $dmp.FullName), '-y', ('"{0}"' -f $sym), '-c', '"!analyze -v; q"') -RedirectStandardOutput $out -NoNewWindow -PassThru
+            if (-not $p.WaitForExit(240000)) { try { $p.Kill() } catch {} }
+            $txt = ''; try { $txt = Get-Content $out -Raw -ErrorAction Stop } catch {}
+            $f = @{}
+            foreach ($key in 'IMAGE_NAME', 'MODULE_NAME', 'PROCESS_NAME', 'FAILURE_BUCKET_ID') { if ($txt -match ('(?m)^{0}:\s+(\S+)' -f $key)) { $f[$key] = $Matches[1] } else { $f[$key] = '' } }
+            [void]$drow.Add(@($dmp.Name, (Format-Stamp $dmp.LastWriteTime), [string]$f['IMAGE_NAME'], [string]$f['PROCESS_NAME'], [string]$f['FAILURE_BUCKET_ID']))
+            if ($f['IMAGE_NAME']) {
+                $own = $f['IMAGE_NAME'] -match '^(ntkrnlmp|ntoskrnl|hal|win32k\w*)\.'
+                Add-Finding 'crash' 'info' ('Dump {0} blames {1}' -f $dmp.Name, $f['IMAGE_NAME']) `
+                    $(if ($own) { 'That is a core Windows component, which usually means the real culprit corrupted memory earlier and Windows merely tripped over it: think RAM or CPU stability rather than Windows itself.' } else { 'This is the module that was executing when Windows crashed. Find which driver package it belongs to in the driver table.' }) '' ''
+            }
+        }
+        Add-Table 'crash' 'Dump analysis (Windows debugger)' @('Dump', 'Written', 'Faulting module', 'Process running', 'Failure bucket') $drow '' $false
+    } elseif ($dumps.Count -gt 0 -and -not $cdb) {
+        Add-Finding 'crash' 'info' 'Minidumps exist but the faulting driver could not be named' `
+            'Reading the driver name out of a dump needs Microsoft''s command-line debugger (cdb.exe), which is not installed.' `
+            'Install the Windows SDK and tick only "Debugging Tools for Windows", then re-run. This tool will then analyse the three newest dumps automatically.' 'https://learn.microsoft.com/windows-hardware/drivers/debugger/'
+    }
+
+    # ---- application crashes
+    $app = @(Get-Ev 'Application' 'Application Error' @(1000)) + @(Get-Ev 'Application' 'Application Hang' @(1002))
+    if ($app.Count -gt 0) {
+        $arow = New-Rows
+        $grp = $app | Group-Object { $m = ''; try { if ($_.Id -eq 1000) { $m = [string]$_.Properties[3].Value } else { $m = '(stopped responding)' } } catch {}; '{0}|{1}' -f [string]$_.Properties[0].Value, $m } | Sort-Object Count -Descending
+        foreach ($x in ($grp | Select-Object -First 12)) {
+            $parts = $x.Name -split '\|'
+            [void]$arow.Add(@($parts[0], $parts[1], [string]$x.Count, (Format-Stamp ($x.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated)))
+        }
+        Add-Table 'crash' ('Application crashes and hangs ({0})' -f $app.Count) @('Program', 'Faulting module', 'Count', 'Most recent') $arow `
+            'A graphics driver module (for example atidxx64.dll, amdxx64.dll, nvwgf2umx.dll) appearing here across several games points at the GPU driver or GPU stability.' $false
+        $worst = $grp | Select-Object -First 1
+        if ($worst.Count -ge 3) {
+            $parts = $worst.Name -split '\|'
+            Add-Finding 'crash' 'info' ('{0} crashed {1} times (module: {2})' -f $parts[0], $worst.Count, $parts[1]) 'One program failing repeatedly in the same module is usually that program or its add-ons. Many programs failing in different modules points back at memory or CPU stability.' '' ''
+        }
+    }
+}
+
 # ------------------------------------------------------------------ drivers
+# AMD publishes one page per product; the index page embeds the full list of them.
+$script:AmdIndex = $null
+$script:AmdNewest = ''
+function Get-MaxVer([string]$text, [string]$pattern) {
+    $best = $null
+    foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { $v = ConvertTo-Ver $m.Groups[1].Value; if ($v -and (-not $best -or $v -gt $best)) { $best = $v } }
+    if ($best) { return [string]$best }
+    return ''
+}
+function Get-AmdIndex {
+    if ($null -eq $script:AmdIndex) {
+        $h = Get-Web 'https://www.amd.com/en/support/download/drivers.html'
+        $script:AmdIndex = @([regex]::Matches($h, 'https://www\.amd\.com/en/support/downloads/drivers\.html/[a-z0-9/_.\-]+\.html') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        $script:AmdNewest = Get-MaxVer $h 'adrenalin-edition-(\d{2}\.\d{1,2}\.\d{1,2})'
+    }
+    return $script:AmdIndex
+}
+function Get-AmdSlug([string]$name) {
+    $s = $name.ToLower() -replace '\((tm|r)\)', ' ' -replace '\s+\d+-core processor.*$', '' -replace '\s+with radeon.*$', '' -replace '\s+series$', ''
+    return (($s -replace '[^a-z0-9]+', '-').Trim('-'))
+}
+function Find-AmdPage([string]$section, [string]$slug) {
+    if (-not $slug) { return '' }
+    $hit = @(Get-AmdIndex) | Where-Object { $_ -match ('/{0}/' -f $section) -and $_.EndsWith('/' + $slug + '.html') } | Select-Object -First 1
+    if ($hit) { return [string]$hit }
+    return ''
+}
+function Get-AmdPageVersions([string]$url) {
+    $h = Get-Web $url
+    return @{
+        Recommended = (Get-MaxVer $h 'whql-amd-software-adrenalin-edition-(\d{2}\.\d{1,2}\.\d{1,2})')
+        Optional = (Get-MaxVer $h '(?<!whql-)amd-software-adrenalin-edition-(\d{2}\.\d{1,2}\.\d{1,2})-win')
+        Chipset = (Get-MaxVer $h 'amd_chipset_software_(\d+\.\d+\.\d+(?:\.\d+)?)')
+    }
+}
+function Get-InstalledProgram([string]$namePattern) {
+    foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+        $hit = Get-ItemProperty $root -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match $namePattern -and $_.DisplayVersion } | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
 function Add-Link([string]$what, [string]$source, [string]$url, [string]$why) {
     [void]$script:Links.Add(@($what, (New-Cell $source '' $url), $why))
 }
@@ -934,7 +1139,7 @@ Invoke-Step 'Drivers' {
     $lrow = New-Rows
     foreach ($gpu in $script:Gpus) {
         $name = [string]$gpu.Name
-        $installed = [string]$gpu.DriverVersion; $latest = ''; $src = ''; $note = ''
+        $installed = [string]$gpu.DriverVersion; $latest = ''; $optional = ''; $src = ''; $note = ''
         $ageDays = 0; if ($gpu.DriverDate) { $ageDays = ($started - [datetime]$gpu.DriverDate).TotalDays }
         try {
             if ($name -match 'NVIDIA') {
@@ -955,15 +1160,25 @@ Invoke-Step 'Drivers' {
                 try {
                     $rk = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction Stop |
                         ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } | Where-Object { $_.RadeonSoftwareVersion } | Select-Object -First 1
-                    if ($rk) { $installed = [string]$rk.RadeonSoftwareVersion }
-                } catch {}
+                    if ($rk) { $installed = ([string]$rk.RadeonSoftwareVersion -replace '[^\d.].*$', '') } else { $installed = '' }
+                } catch { $installed = '' }
+                if (-not $installed) {
+                    $prog = Get-InstalledProgram '^AMD Software$|^AMD Software: Adrenalin'
+                    if ($prog) { $installed = [string]$prog.DisplayVersion }
+                }
                 if (-not $Offline) {
-                    $html = Get-Web $src
-                    $m = [regex]::Matches($html, 'Adrenalin(?:\s+Edition)?\s+(\d{2}\.\d{1,2}\.\d{1,2})')
-                    $best = $null
-                    foreach ($x in $m) { $v = ConvertTo-Ver $x.Groups[1].Value; if ($v -and (-not $best -or $v -gt $best)) { $best = $v } }
-                    if ($best) { $latest = [string]$best }
-                    $note = 'Latest Adrenalin Edition release named on AMD''s download page.'
+                    $page = Find-AmdPage 'graphics' (Get-AmdSlug $name)
+                    # integrated graphics ("AMD Radeon(TM) Graphics") are listed under the processor instead
+                    if (-not $page -and $name -notmatch '\d') { $page = Find-AmdPage 'processors' (Get-AmdSlug ([string](Get-Cim 'Win32_Processor' | Select-Object -First 1).Name)) }
+                    if ($page) {
+                        $src = $page
+                        $pv = Get-AmdPageVersions $page
+                        $latest = $pv.Recommended; $optional = $pv.Optional
+                        if (-not $latest) { $latest = $optional; $optional = '' }
+                        $note = 'From AMD''s download page for this exact product. "Latest found" is the WHQL (Recommended) release.'
+                    } else {
+                        $note = ('AMD lists no download page under this adapter''s name, which is typical of older cards on a legacy driver branch. The newest Adrenalin release overall is {0}, but it may not support this card.' -f $script:AmdNewest)
+                    }
                 }
             } elseif ($name -match 'Intel') {
                 $src = 'https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html'
@@ -979,30 +1194,84 @@ Invoke-Step 'Drivers' {
         $verdict = New-Cell 'Not checked' '' ''
         if ($latest) {
             $vi = ConvertTo-Ver $installed; $vl = ConvertTo-Ver $latest
+            $vo = ConvertTo-Ver $optional
             if ($vi -and $vl -and $vl -gt $vi) {
-                $sev = 'info'; if ($ageDays -gt 180) { $sev = 'warn' }
-                $verdict = New-Cell 'Newer available' $sev ''
-                Add-Finding 'drivers' $sev ('{0}: driver {1} installed, {2} available' -f $name, $installed, $latest) `
-                    ('Installed driver is dated {0}. Newest is not automatically best for a GPU: if the current one is stable in your games, updating is a choice rather than a fix.' -f (Format-Day $gpu.DriverDate)) `
-                    'Download from the vendor (link in the table below).' $src
+                $verdict = New-Cell 'Out of date' 'warn' ''
+                Add-Finding 'drivers' 'warn' ('{0}: graphics driver {1} installed, {2} available' -f $name, $installed, $latest) `
+                    ('Installed driver is dated {0}. {1}' -f (Format-Day $gpu.DriverDate), $(if ($optional) { 'A newer optional release, {0}, also exists.' -f $optional } else { '' })) `
+                    'Download from the vendor (link in the table below). If the current driver is stable in your games, read the release notes first: newest is not automatically best for a GPU.' $src
+            } elseif ($vi -and $vl -and $vo -and $vo -gt $vi) {
+                $verdict = New-Cell 'Current (newer optional exists)' 'info' ''
+                Add-Finding 'drivers' 'info' ('{0}: on the recommended driver {1}; optional {2} is available' -f $name, $installed, $optional) 'Optional releases carry newer game support but have had less testing than the WHQL release.' '' $src
             } elseif ($vi -and $vl) {
                 $verdict = New-Cell 'Up to date' 'ok' ''
                 Add-Finding 'drivers' 'ok' ('{0}: graphics driver is current ({1})' -f $name, $installed) '' '' ''
-            } else { $verdict = New-Cell 'Could not compare' '' '' }
-        } elseif ($ageDays -gt 365) {
-            $verdict = New-Cell 'Over a year old' 'warn' ''
-            Add-Finding 'drivers' 'warn' ('{0}: graphics driver is over a year old ({1})' -f $name, (Format-Day $gpu.DriverDate)) $note 'Check the vendor page for a current driver.' $src
+            } else {
+                $verdict = New-Cell 'Could not compare' 'info' ''
+                Add-Finding 'drivers' 'info' ('{0}: latest driver is {1}, but the installed version could not be read' -f $name, $latest) 'The vendor software does not appear to be installed, or it records its version somewhere this tool does not look.' 'Compare by eye against the vendor page.' $src
+            }
+        } else {
+            $sev = 'info'; if ($ageDays -gt 365) { $sev = 'warn' }
+            $verdict = New-Cell 'Not verified' $sev ''
+            Add-Finding 'drivers' $sev ('{0}: could not verify the graphics driver against the vendor (installed driver dated {1})' -f $name, (Format-Day $gpu.DriverDate)) `
+                $(if ($note) { $note } elseif ($Offline) { 'Offline mode: no vendor lookup was made.' } else { 'The vendor lookup returned no version.' }) 'Check the vendor page by hand.' $src
         }
-        [void]$lrow.Add(@($name, $installed, (Format-Day $gpu.DriverDate), $(if ($latest) { $latest } else { '-' }), $verdict, (New-Cell 'Vendor download page' '' $src), $note))
+        $latestTxt = '-'; if ($latest) { $latestTxt = $latest; if ($optional) { $latestTxt += (' (optional: {0})' -f $optional) } }
+        [void]$lrow.Add(@($name, $installed, (Format-Day $gpu.DriverDate), $latestTxt, $verdict, (New-Cell 'Vendor download page' '' $src), $note))
         if ($src) { Add-Link ('Graphics: {0}' -f $name) 'Vendor download page' $src 'Always take GPU drivers from the GPU vendor.' }
     }
-    Add-Table 'drivers' 'Graphics driver: installed versus latest' @('Adapter', 'Installed', 'Dated', 'Latest found', 'Verdict', 'Get it', 'Note') $lrow `
-        'The live lookup uses the vendors'' public web pages, not an official API, so it can fail when they change their sites.' $false
+
+    # ---- AMD chipset package: installed versus AMD's page for this board's chipset
+    $cpu0 = Get-Cim 'Win32_Processor' | Select-Object -First 1
+    if ($cpu0 -and [string]$cpu0.Name -match 'AMD') {
+        $csrc = 'https://www.amd.com/en/support/download/drivers.html'; $clatest = ''; $cnote = ''
+        $cprog = Get-InstalledProgram '^AMD Chipset Software'
+        $cinst = ''; if ($cprog) { $cinst = [string]$cprog.DisplayVersion }
+        if (-not $Offline) {
+            try {
+                $page = ''
+                $prodName = ''; if ($script:Board) { $prodName = [string]$script:Board.Product }
+                if ($prodName -match '(?<![A-Za-z0-9])([ABXabx]\d{3}[Ee]?)') {
+                    $tok = $Matches[1].ToLower()
+                    $page = Find-AmdPage 'chipsets' $tok
+                    if (-not $page) { $page = Find-AmdPage 'chipsets' $tok.TrimEnd('e') }
+                }
+                if (-not $page -and [string]$cpu0.SocketDesignation -match '(AM\d)') {
+                    # every chipset on a socket shares one package, so any page for that socket gives the right version
+                    $sock = $Matches[1].ToLower()
+                    $page = [string](@(Get-AmdIndex) | Where-Object { $_ -match ('/chipsets/{0}/' -f $sock) } | Select-Object -First 1)
+                    $cnote = 'Board chipset not recognised from its name; version taken from AMD''s page for this CPU socket.'
+                }
+                if ($page) { $csrc = $page; $clatest = (Get-AmdPageVersions $page).Chipset }
+            } catch { $cnote = 'Live lookup failed ({0}).' -f (Get-Short $_.Exception.Message 80) }
+        }
+        $vi = ConvertTo-Ver $cinst; $vl = ConvertTo-Ver $clatest
+        if (-not $cinst) {
+            $cver = New-Cell 'Not installed' 'warn' ''
+            Add-Finding 'drivers' 'warn' 'AMD chipset driver package is not installed' `
+                ('Windows is using its own in-box drivers for the chipset. AMD''s package adds the Ryzen power plan provisioning, PCI, GPIO, I2C and (on X3D parts) the 3D V-Cache optimiser.{0}' -f $(if ($clatest) { ' Current version: ' + $clatest + '.' } else { '' })) `
+                'Install the AMD chipset drivers from the linked page.' $csrc
+        } elseif ($vi -and $vl -and $vl -gt $vi) {
+            $cver = New-Cell 'Out of date' 'warn' ''
+            Add-Finding 'drivers' 'warn' ('AMD chipset drivers: {0} installed, {1} available' -f $cinst, $clatest) 'From AMD''s download page for this chipset.' 'Download and install the newer package, then restart.' $csrc
+        } elseif ($vi -and $vl) {
+            $cver = New-Cell 'Up to date' 'ok' ''
+            Add-Finding 'drivers' 'ok' ('AMD chipset drivers are current ({0})' -f $cinst) '' '' ''
+        } else {
+            $cver = New-Cell 'Not verified' 'info' ''
+            Add-Finding 'drivers' 'info' ('AMD chipset drivers {0} installed; could not verify against AMD' -f $cinst) $(if ($cnote) { $cnote } elseif ($Offline) { 'Offline mode.' } else { 'No version found on AMD''s page.' }) 'Check the AMD page by hand.' $csrc
+        }
+        $cdate = ''; if ($cprog -and $cprog.InstallDate -match '^(\d{4})(\d{2})(\d{2})$') { $cdate = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
+        [void]$lrow.Add(@('AMD chipset drivers', $(if ($cinst) { $cinst } else { '-' }), $cdate, $(if ($clatest) { $clatest } else { '-' }), $cver, (New-Cell 'AMD chipset page' '' $csrc), $cnote))
+        Add-Link 'Chipset (AMD)' 'AMD chipset drivers' $csrc 'AMD''s page for this chipset. Includes the power plan and PCI drivers.'
+    }
+
+    Add-Table 'drivers' 'Vendor drivers: installed versus latest' @('Component', 'Installed', 'Dated', 'Latest found', 'Verdict', 'Get it', 'Note') $lrow `
+        'Versions are read live from the vendors'' own download pages. They publish no official API, so a lookup can fail if a site changes; that is reported as "Not verified", never as "up to date".' $false
 
     # ---- where to get everything else
     $cpuName = [string](Get-Cim 'Win32_Processor' | Select-Object -First 1).Name
-    if ($cpuName -match 'AMD') { Add-Link 'Chipset (AMD)' 'AMD chipset drivers' 'https://www.amd.com/en/support/download/drivers.html' 'Choose Chipsets, then your socket and chipset. Includes the power plan and PCI drivers.' }
-    elseif ($cpuName -match 'Intel') { Add-Link 'Chipset, Wi-Fi, Bluetooth, LAN (Intel)' 'Intel Driver & Support Assistant' 'https://www.intel.com/content/www/us/en/support/detect.html' 'Intel''s own scanner identifies and updates Intel components.' }
+    if ($cpuName -match 'Intel') { Add-Link 'Chipset, Wi-Fi, Bluetooth, LAN (Intel)' 'Intel Driver & Support Assistant' 'https://www.intel.com/content/www/us/en/support/detect.html' 'Intel''s own scanner identifies and updates Intel components.' }
     $mfr = ''; $prod = ''
     if ($script:Board) { $mfr = [string]$script:Board.Manufacturer; $prod = [string]$script:Board.Product }
     $sysMfr = [string](Get-Cim 'Win32_ComputerSystem' | Select-Object -First 1).Manufacturer

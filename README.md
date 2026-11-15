@@ -28,6 +28,7 @@ Options for `Get-PCHealth.ps1`:
 
 | Area | Evidence |
 |---|---|
+| Crashes | A timeline of every blue screen and unexpected shutdown: bugcheck code decoded to a prime suspect, the hardware, GPU and disk errors logged around it, the pattern across crashes, plus application crashes by faulting module. If Microsoft's `cdb.exe` debugger is installed, the three newest minidumps are analysed to name the faulting driver |
 | CPU | Machine-check (WHEA) errors, firmware throttling events, temperature, microcode revision |
 | GPU | Driver crash/recovery (TDR) events, GPU watchdog dumps, device error codes, temperature |
 | Memory | WHEA memory errors, last Windows Memory Diagnostic result, rated versus running speed |
@@ -48,9 +49,14 @@ Options for `Get-PCHealth.ps1`:
   not run the scan with a protected game open. Recent releases may also need
   the separate PawnIO driver for CPU and motherboard sensors; the dashboard
   says so if those readings are missing.
-- **The live GPU driver lookup uses the vendors' public web pages**, not an
-  official API. If a vendor changes its site the lookup reports a failure and
-  falls back to the driver's age and a download link.
+- **Installed-versus-latest is checked live for AMD graphics, AMD chipset and
+  NVIDIA graphics**, by reading the vendor's own download page for the exact
+  product. Vendors publish no official API, so if a site changes the lookup is
+  reported as "Not verified", never as "up to date". Intel graphics is
+  best-effort. Motherboard-maker items (BIOS, audio, LAN) are not version
+  checked; the dashboard links to the support page instead.
+- **Naming the driver behind a blue screen needs `cdb.exe`.** Install the
+  Windows SDK and tick only "Debugging Tools for Windows".
 - **Windows Update search** can take a minute. Use `-Offline` to skip it.
 
 ## Files
