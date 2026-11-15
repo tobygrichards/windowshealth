@@ -90,6 +90,9 @@ powershell -ExecutionPolicy Bypass -File tests\Run-Tests.ps1
 pwsh -File tests/Smoke-Test.ps1
 ```
 
+<img width="1192" height="891" alt="image" src="https://github.com/user-attachments/assets/81c6539a-8f11-4d66-86f5-59531600bd67" />
+
+
 The rules tests run anywhere. The smoke test needs PowerShell 7 and replaces the
 Windows-only queries with a simulated machine, so it proves the collector runs
 end to end and judges the simulated data correctly; it does not prove the real
