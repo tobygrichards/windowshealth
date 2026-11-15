@@ -1,0 +1,171 @@
+{
+ "library": "LibreHardwareMonitorLib 0.9.6",
+ "source": "https://api.nuget.org/v3-flatcontainer",
+ "frameworks": {
+  "net472": [
+   {
+    "id": "BlackSharp.Core",
+    "version": "1.0.7",
+    "path": "lib/net472/BlackSharp.Core.dll",
+    "name": "BlackSharp.Core.dll",
+    "sha256": "CAFB93AFCC8D8A367E21F619673D05C06887D8964867FED1371F02DED1CD3E23"
+   },
+   {
+    "id": "DiskInfoToolkit",
+    "version": "1.1.2",
+    "path": "lib/net472/DiskInfoToolkit.dll",
+    "name": "DiskInfoToolkit.dll",
+    "sha256": "1ACBF51B3C10C51C986CF43021680D34A2E38D9A5BA652BCFA9A1B5F7FC09800"
+   },
+   {
+    "id": "HidSharp",
+    "version": "2.6.4",
+    "path": "lib/net35/HidSharp.dll",
+    "name": "HidSharp.dll",
+    "sha256": "D86690EFDE30EA9179F669320F39148853793B743A98B531AFEAF30598E22F54"
+   },
+   {
+    "id": "LibreHardwareMonitorLib",
+    "version": "0.9.6",
+    "path": "runtimes/win-x64/lib/net472/LibreHardwareMonitorLib.dll",
+    "name": "LibreHardwareMonitorLib.dll",
+    "sha256": "6EBC194316536BA61AF5BE24508AD9FCBB2ECC685E716C12E787C79530F66BF0"
+   },
+   {
+    "id": "RAMSPDToolkit-NDD",
+    "version": "1.4.2",
+    "path": "lib/net472/RAMSPDToolkit-NDD.dll",
+    "name": "RAMSPDToolkit-NDD.dll",
+    "sha256": "B6882354C7C8EC186617E421507743DBFAE09C5C1FC24CEF76A1D0C0C26651DE"
+   },
+   {
+    "id": "System.Buffers",
+    "version": "4.6.1",
+    "path": "lib/net462/System.Buffers.dll",
+    "name": "System.Buffers.dll",
+    "sha256": "2D78D770C9CB997199154AE8C018B9F1D1EFBC86729F7264DDE6DBAD2A12CAC3"
+   },
+   {
+    "id": "System.CodeDom",
+    "version": "10.0.2",
+    "path": "lib/net462/System.CodeDom.dll",
+    "name": "System.CodeDom.dll",
+    "sha256": "ADAB61FFC51EF97AD6F3DA0AF3AA6FA4324DB70F817E6D31FC765F53DC3D2881"
+   },
+   {
+    "id": "System.Memory",
+    "version": "4.6.3",
+    "path": "lib/net462/System.Memory.dll",
+    "name": "System.Memory.dll",
+    "sha256": "D5E8E4866F9CFA66F7765660F84B210198893E55335487AFE5EBDA342C0E913D"
+   },
+   {
+    "id": "System.Numerics.Vectors",
+    "version": "4.6.1",
+    "path": "lib/net462/System.Numerics.Vectors.dll",
+    "name": "System.Numerics.Vectors.dll",
+    "sha256": "20C2FA81B8C70D651099D762954F285FD4F942E63B2D7217C145DAB8D4B2F4C9"
+   },
+   {
+    "id": "System.Runtime.CompilerServices.Unsafe",
+    "version": "6.1.2",
+    "path": "lib/net462/System.Runtime.CompilerServices.Unsafe.dll",
+    "name": "System.Runtime.CompilerServices.Unsafe.dll",
+    "sha256": "08CBD7278B66F1E68425A82D4B97181A4130D93E3DD91831407ABA7212CCDACF"
+   },
+   {
+    "id": "System.Security.AccessControl",
+    "version": "6.0.0",
+    "path": "runtimes/win/lib/net461/System.Security.AccessControl.dll",
+    "name": "System.Security.AccessControl.dll",
+    "sha256": "FF14C5F628B9A6798D173AEFBBA0A43D61E66F715108E2576AC0D3DFAB9071D0"
+   },
+   {
+    "id": "System.Security.Principal.Windows",
+    "version": "5.0.0",
+    "path": "runtimes/win/lib/net461/System.Security.Principal.Windows.dll",
+    "name": "System.Security.Principal.Windows.dll",
+    "sha256": "B4D8E15ADC235D0E858E39B5133E5D00A4BAA8C94F4F39E3B5E791B0F9C0C806"
+   },
+   {
+    "id": "System.Threading.AccessControl",
+    "version": "10.0.3",
+    "path": "lib/net462/System.Threading.AccessControl.dll",
+    "name": "System.Threading.AccessControl.dll",
+    "sha256": "5E3A3902F04F840C0FC1F9C2F249F804F6CFDF7901B2E06778BC2A4603AE4694"
+   }
+  ],
+  "net8.0": [
+   {
+    "id": "BlackSharp.Core",
+    "version": "1.0.7",
+    "path": "lib/net8.0/BlackSharp.Core.dll",
+    "name": "BlackSharp.Core.dll",
+    "sha256": "98972909C6303A4D4CBAB3194839599F9E62BC2B921AEA9ED91E3DD46E06237C"
+   },
+   {
+    "id": "DiskInfoToolkit",
+    "version": "1.1.2",
+    "path": "lib/net8.0/DiskInfoToolkit.dll",
+    "name": "DiskInfoToolkit.dll",
+    "sha256": "F709A8C80EB7679B971AAA4CAFEF5B11045C13F765D4443756427F3169138EDD"
+   },
+   {
+    "id": "HidSharp",
+    "version": "2.6.4",
+    "path": "lib/netstandard2.0/HidSharp.dll",
+    "name": "HidSharp.dll",
+    "sha256": "79F2BC8DDFF102E6DBEDE84B2C211A3AEA2ED675BF762FA0F02ECB65F61EE812"
+   },
+   {
+    "id": "LibreHardwareMonitorLib",
+    "version": "0.9.6",
+    "path": "runtimes/win-x64/lib/net8.0/LibreHardwareMonitorLib.dll",
+    "name": "LibreHardwareMonitorLib.dll",
+    "sha256": "C2274F91322207EE86C344C76E791E7FDF6507ACE95546ADE2C5DF3ABE274246"
+   },
+   {
+    "id": "Mono.Posix.NETStandard",
+    "version": "1.0.0",
+    "path": "runtimes/win-x64/lib/netstandard2.0/Mono.Posix.NETStandard.dll",
+    "name": "Mono.Posix.NETStandard.dll",
+    "sha256": "BE0215D90462ADBAE5F03D6E5C3A969C9842A866B013DF7A395769C5C352FA7E"
+   },
+   {
+    "id": "RAMSPDToolkit-NDD",
+    "version": "1.4.2",
+    "path": "lib/net8.0/RAMSPDToolkit-NDD.dll",
+    "name": "RAMSPDToolkit-NDD.dll",
+    "sha256": "04840B4479941DCEF17C73ECF66827AEB717F0E90F904552DA6AE517264378CA"
+   },
+   {
+    "id": "System.CodeDom",
+    "version": "10.0.2",
+    "path": "lib/net8.0/System.CodeDom.dll",
+    "name": "System.CodeDom.dll",
+    "sha256": "2211F23BDE4ECF88B9AB58ED2CAB76C8D88E59E99EB3ED77231F34577F1B6D95"
+   },
+   {
+    "id": "System.IO.Ports",
+    "version": "10.0.3",
+    "path": "runtimes/win/lib/net8.0/System.IO.Ports.dll",
+    "name": "System.IO.Ports.dll",
+    "sha256": "D494C8F12CDAFA16005A0E6E21375644102AB45926982FA50D858E65579A67F6"
+   },
+   {
+    "id": "System.Management",
+    "version": "10.0.2",
+    "path": "runtimes/win/lib/net8.0/System.Management.dll",
+    "name": "System.Management.dll",
+    "sha256": "5159D5639053C4F1FDB75195BB5AF3351A69A6FE086BACB2837FCFE626312162"
+   },
+   {
+    "id": "System.Threading.AccessControl",
+    "version": "10.0.3",
+    "path": "runtimes/win/lib/net8.0/System.Threading.AccessControl.dll",
+    "name": "System.Threading.AccessControl.dll",
+    "sha256": "63F2228E1A7B6BE9ADFD74E9030D7C8B02606AE9894524FE6650DF15BC2C43E0"
+   }
+  ]
+ }
+}

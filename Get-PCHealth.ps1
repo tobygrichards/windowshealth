@@ -80,7 +80,14 @@ if (-not $IsAdmin -and $PSCommandPath) {
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
+# -------------------------------------------------------------------- rules
+$rulesPath = Join-Path $PSScriptRoot 'PCHealth.Rules.ps1'
+if (-not (Test-Path $rulesPath)) { Write-Error 'PCHealth.Rules.ps1 must be in the same folder as this script.'; return }
+. $rulesPath
+
 # ------------------------------------------------------------------ helpers
+$script:StepFailures = 0
+$script:AppxAll = $null
 $script:Areas = [ordered]@{}
 $script:Errors = New-Object System.Collections.ArrayList
 $script:Sensors = New-Object System.Collections.ArrayList
@@ -103,8 +110,12 @@ function Add-Fact([string]$area, [string]$k, $v) {
     if ($null -eq $v -or "$v" -eq '') { return }
     [void]$script:Areas[$area].facts.Add([ordered]@{ k = $k; v = [string]$v })
 }
-# sev: ok | info | warn | crit
+# sev: ok | info | warn | crit | gap   (gap = this could not be checked)
 function Add-Finding([string]$area, [string]$sev, [string]$title, [string]$detail, [string]$action, [string]$link) {
+    if ($sev -eq 'ok' -and $script:StepFailures -gt 0) {
+        $sev = 'gap'; $title = 'Not verified: ' + $title
+        $detail = ('One or more queries behind this check failed, so "nothing found" cannot be trusted here. See the collection notes at the bottom of the page. ' + $detail).Trim()
+    }
     [void]$script:Areas[$area].findings.Add([ordered]@{
         sev = $sev; title = $title; detail = $detail; action = $action; link = $link })
 }
@@ -136,17 +147,35 @@ function Get-Short([string]$s, [int]$n) {
     if ($s.Length -gt $n) { return $s.Substring(0, $n) + '...' }
     return $s
 }
+# A query that FAILS must never look like a query that found nothing. Failures are recorded, and any
+# "all clear" finding raised in the same step is downgraded to "could not be checked" (see Add-Finding).
+function Register-QueryFailure([string]$what, $err) {
+    $script:StepFailures++
+    [void]$script:Errors.Add(('{0} could not be read: {1}' -f $what, (Get-Short ([string]$err.Exception.Message) 160)))
+}
 function Get-Ev([string]$log, [string]$provider, [int[]]$ids) {
     $f = @{ LogName = $log; StartTime = $Since }
     if ($provider) { $f.ProviderName = $provider }
     if ($ids) { $f.Id = $ids }
-    try { return @(Get-WinEvent -FilterHashtable $f -MaxEvents 500 -ErrorAction Stop) } catch { return @() }
+    try { return @(Get-WinEvent -FilterHashtable $f -MaxEvents 500 -ErrorAction Stop) }
+    catch {
+        # "no events match" and "this PC has no such event source" are genuine empties, not failures
+        if ([string]$_.FullyQualifiedErrorId -notmatch 'NoMatching(Events|Providers|Logs)Found') {
+            Register-QueryFailure ('Event log {0} ({1})' -f $log, $(if ($provider) { $provider } else { 'all sources' })) $_
+        }
+        return @()
+    }
 }
-function Get-Cim([string]$class, [string]$ns, [string]$filter) {
+# -Optional: the class legitimately does not exist on many PCs (battery, ATA failure prediction), so a failure is not reported.
+function Get-Cim([string]$class, [string]$ns, [string]$filter, [switch]$Optional) {
     $p = @{ ClassName = $class; ErrorAction = 'Stop' }
     if ($ns) { $p.Namespace = $ns }
     if ($filter) { $p.Filter = $filter }
-    try { return @(Get-CimInstance @p) } catch { return @() }
+    try { return @(Get-CimInstance @p) }
+    catch {
+        if (-not $Optional) { Register-QueryFailure ('WMI class {0}' -f $class) $_ }
+        return @()
+    }
 }
 function Get-Web([string]$url) {
     $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
@@ -154,7 +183,9 @@ function Get-Web([string]$url) {
 }
 function Invoke-Step([string]$name, [scriptblock]$body) {
     Write-Host ('  - {0}' -f $name)
+    $script:StepFailures = 0
     try { & $body } catch {
+        $script:StepFailures++
         [void]$script:Errors.Add(('{0}: {1}' -f $name, $_.Exception.Message))
         Write-Host ('      (problem: {0})' -f $_.Exception.Message) -ForegroundColor DarkYellow
     }
@@ -162,12 +193,6 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
 function Get-Sens([string]$hwTypePattern, [string]$type) {
     return @($script:Sensors | Where-Object { $_.Valid -and $_.HwType -match $hwTypePattern -and $_.Type -eq $type -and -not ($type -eq 'Temperature' -and $_.Name -match $script:RefSensor) })
 }
-function Get-TempSev([double]$v, [double]$warn, [double]$crit) {
-    if ($v -ge $crit) { return 'crit' }
-    if ($v -ge $warn) { return 'warn' }
-    return 'ok'
-}
-
 New-Area 'crash' 'Crashes'
 New-Area 'cpu' 'CPU'
 New-Area 'gpu' 'GPU'
@@ -184,35 +209,47 @@ Write-Host ('Looking back {0} days in the event logs.' -f $Days)
 Write-Host ''
 
 # ------------------------------------------------- sensors (LibreHardwareMonitor)
+# The sensor library is loaded into an elevated process, so it is pinned: sensor-packages.json lists the exact
+# NuGet packages and the SHA-256 of every DLL. Files are fetched from nuget.org (packages there are immutable),
+# and EVERY file is re-verified on EVERY run before anything is loaded, so neither a changed upstream release
+# nor a DLL planted in the lib folder can get code executed.
+$script:LhmAllowed = @()
 function Get-LhmLibrary {
-    $dir = Join-Path $PSScriptRoot 'lib\LibreHardwareMonitor'
-    $dll = $null
-    if (Test-Path $dir) {
-        $dll = Get-ChildItem $dir -Filter 'LibreHardwareMonitorLib.dll' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    $manifestPath = Join-Path $PSScriptRoot 'sensor-packages.json'
+    if (-not (Test-Path $manifestPath)) { $script:SensorNote = 'sensor-packages.json is missing from the tool folder, so the sensor library was not loaded.'; return $null }
+    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    $fw = 'net472'; if ($PSVersionTable.PSEdition -eq 'Core') { $fw = 'net8.0' }
+    $files = @($manifest.frameworks.$fw)
+    $dir = Join-Path $PSScriptRoot ('lib\sensors-' + $fw)
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $bad = @($files | Where-Object { $p = Join-Path $dir $_.name; -not (Test-Path $p) -or (Get-FileHash -Path $p -Algorithm SHA256).Hash -ne $_.sha256 })
+    if ($bad.Count -gt 0) {
+        if ($Offline) { $script:SensorNote = 'Offline mode and no verified local copy of the sensor library.'; return $null }
+        Write-Host ('      downloading {0} from nuget.org (first run only)...' -f $manifest.library)
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        foreach ($grp in ($bad | Group-Object { '{0}/{1}' -f $_.id, $_.version })) {
+            $f0 = $grp.Group[0]
+            $idl = ([string]$f0.id).ToLower(); $verl = ([string]$f0.version).ToLower()
+            $pkg = Join-Path ([IO.Path]::GetTempPath()) ('pchealth-{0}.{1}.zip' -f $idl, $verl)
+            Invoke-WebRequest -Uri ('{0}/{1}/{2}/{1}.{2}.nupkg' -f $manifest.source, $idl, $verl) -OutFile $pkg -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+            $zip = [IO.Compression.ZipFile]::OpenRead($pkg)
+            try {
+                foreach ($f in $grp.Group) {
+                    $entry = $zip.Entries | Where-Object { $_.FullName -eq $f.path } | Select-Object -First 1
+                    if (-not $entry) { throw ('{0} not found inside package {1} {2}' -f $f.path, $f.id, $f.version) }
+                    [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $dir $f.name), $true)
+                }
+            } finally { $zip.Dispose(); Remove-Item $pkg -Force -ErrorAction SilentlyContinue }
+        }
     }
-    if ($dll) { return $dll }
-    if ($Offline) { $script:SensorNote = 'Offline mode and no local copy of LibreHardwareMonitor.'; return $null }
-
-    Write-Host '      downloading LibreHardwareMonitor from GitHub (first run only)...'
-    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest' `
-        -Headers @{ 'User-Agent' = 'pc-health-check' } -TimeoutSec 30 -ErrorAction Stop
-    $zips = @($rel.assets | Where-Object { $_.name -match '\.zip$' })
-    $asset = $null
-    if ($PSVersionTable.PSEdition -eq 'Core') {
-        $asset = $zips | Where-Object { $_.name -notmatch 'net4' } | Select-Object -First 1
-    } else {
-        $asset = $zips | Where-Object { $_.name -match 'net4' } | Select-Object -First 1
-        if (-not $asset) { $asset = $zips | Where-Object { $_.name -match '^LibreHardwareMonitor\.zip$' } | Select-Object -First 1 }
+    foreach ($f in $files) {
+        $p = Join-Path $dir $f.name
+        if (-not (Test-Path $p) -or (Get-FileHash -Path $p -Algorithm SHA256).Hash -ne $f.sha256) {
+            throw ('Sensor library integrity check failed for {0}: the file does not match the pinned SHA-256, so nothing was loaded. Delete the lib folder and re-run.' -f $f.name)
+        }
     }
-    if (-not $asset) { $asset = $zips | Select-Object -First 1 }
-    if (-not $asset) { throw 'No downloadable LibreHardwareMonitor package found.' }
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $zip = Join-Path $dir $asset.name
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-    Expand-Archive -Path $zip -DestinationPath $dir -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    Set-Content -Path (Join-Path $dir 'VERSION.txt') -Value ('{0} ({1})' -f $rel.tag_name, $asset.name)
-    return (Get-ChildItem $dir -Filter 'LibreHardwareMonitorLib.dll' -Recurse | Select-Object -First 1)
+    $script:LhmAllowed = @($files | ForEach-Object { [string]$_.name })
+    return (Get-Item (Join-Path $dir 'LibreHardwareMonitorLib.dll'))
 }
 
 $script:SensorMap = @{}
@@ -230,7 +267,7 @@ function Read-LhmHardware($hw) {
             if (-not $o) {
                 $o = [pscustomobject]@{
                     Hw = [string]$hw.Name; HwType = [string]$hw.HardwareType
-                    Name = [string]$s.Name; Type = [string]$s.SensorType; Value = $v; Min = $v; Max = $v; Valid = $true; Note = ''; Step = 0.0 }
+                    Name = [string]$s.Name; Type = [string]$s.SensorType; Value = $v; Min = $v; Max = $v; Valid = $true; Note = ''; Step = 0.0; Id = [string]$hw.Identifier }
                 $script:SensorMap[$key] = $o
                 [void]$script:Sensors.Add($o)
             } else {
@@ -243,13 +280,6 @@ function Read-LhmHardware($hw) {
     }
     foreach ($sub in $hw.SubHardware) { Read-LhmHardware $sub }
 }
-function Get-RailNominal([string]$n) {
-    if ($n -match '12\s?V') { return 12 }
-    if ($n -match '(^|[^\d.])\+?5\s?V') { return 5 }
-    if ($n -match '3\.3\s?V|3VCC|3V3|AVCC|3VSB|AVSB') { return 3.3 }
-    return 0
-}
-
 if (-not $NoSensors) {
     Invoke-Step 'Sensors (LibreHardwareMonitor)' {
         if (-not $IsAdmin) { $script:SensorNote = 'Not elevated, sensors skipped.'; return }
@@ -261,7 +291,7 @@ if (-not $NoSensors) {
             param($sender, $e)
             $n = (New-Object Reflection.AssemblyName $e.Name).Name
             $p = Join-Path $script:LhmDir ($n + '.dll')
-            if (Test-Path $p) { return [Reflection.Assembly]::LoadFrom($p) }
+            if ($script:LhmAllowed -contains ($n + '.dll') -and (Test-Path $p)) { return [Reflection.Assembly]::LoadFrom($p) }
             return $null
         }
         [AppDomain]::CurrentDomain.add_AssemblyResolve($resolver)
@@ -311,9 +341,8 @@ if (-not $NoSensors) {
         # its inputs are wired differently on every board and other monitoring software can corrupt its readings.
         foreach ($s in $script:Sensors) {
             if (-not $s.Valid) { continue }
-            # nothing with thermal mass moves 20 C in a second, and a supply rail does not jump 10 % between samples
-            if ($s.Type -eq 'Temperature' -and $s.Step -gt 20) { $s.Valid = $false; $s.Note = ('Erratic: jumped {0:N0} C between samples a few seconds apart, which is not physically possible' -f $s.Step) }
-            if ($s.Type -eq 'Voltage' -and $s.HwType -eq 'SuperIO' -and $s.Max -gt 0.5 -and ($s.Step / $s.Max) -gt 0.10) { $s.Valid = $false; $s.Note = 'Erratic: jumped more than 10 % between samples a few seconds apart' }
+            $why = Test-SensorErratic $s
+            if ($why) { $s.Valid = $false; $s.Note = $why }
         }
         # cross-check the chip's CPU temperature against the CPU's own internal sensor
         $own = $script:Sensors | Where-Object { $_.Valid -and $_.HwType -eq 'Cpu' -and $_.Type -eq 'Temperature' -and $_.Name -match 'Package|Tctl|Tdie' } | Sort-Object Value -Descending | Select-Object -First 1
@@ -333,92 +362,6 @@ if (-not $NoSensors) {
     }
 } else {
     $script:SensorNote = 'Sensors disabled with -NoSensors.'
-}
-
-$script:RefSensor = 'Warning|Critical|Threshold|Limit|Resolution|Distance|TjMax|Offset'
-# @(warning, critical) temperature for a drive: its own published limits if present, else general guidance
-function Get-DriveTempLimits([string]$hwName) {
-    $w = 70; $c = 80
-    $own = @($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Type -eq 'Temperature' -and $_.Hw -eq $hwName })
-    $ow = $own | Where-Object { $_.Name -match 'Warning' -and $_.Value -gt 40 } | Select-Object -First 1
-    $oc = $own | Where-Object { $_.Name -match 'Critical' -and $_.Value -gt 40 } | Select-Object -First 1
-    if ($ow) { $w = $ow.Value }
-    if ($oc) { $c = $oc.Value } elseif ($ow) { $c = $ow.Value + 5 }
-    return @($w, $c)
-}
-$script:CpuTjMax = 95
-# The range a sensor is EXPECTED to sit in for this kind of component.
-# Returns @(low, high, criticalLow, criticalHigh, explanation used when outside, raiseFinding) or nothing when
-# the sensor has no meaningful range (clock speeds, loads) or cannot be identified.
-function Get-SensorSpec($s) {
-    $n = $s.Name; $none = -1e9
-    if ($s.Type -eq 'Temperature') {
-        if ($n -match $script:RefSensor) { return }
-        if ($s.HwType -eq 'Cpu') { return @(10, ($script:CpuTjMax - 5), $none, ($script:CpuTjMax + 3), '', $false) }
-        if ($s.HwType -match '^Gpu') {
-            if ($n -match 'Hot ?Spot') { return @(10, 100, $none, 110, 'The hot spot is the hottest point on the GPU die. A gap of more than about 25 C above the core temperature suggests dried thermal paste or poor cooler contact.', $true) }
-            return @(10, 88, $none, 100, '', $false)
-        }
-        if ($s.HwType -eq 'Storage') { $lim = Get-DriveTempLimits $s.Hw; return @(0, ($lim[0] - 5), $none, $lim[1], '', $false) }
-        if ($s.HwType -eq 'Memory') { return @(10, 55, $none, 65, 'Hot memory produces errors, particularly with XMP / EXPO enabled.', $true) }
-        if ($n -match 'VRM|MOS') { return @(10, 100, $none, 115, 'The VRM feeds the CPU. Overheating VRMs throttle the CPU and cause shutdowns under load; improve airflow around the CPU socket.', $true) }
-        if ($n -match 'Chipset|PCH') { return @(10, 80, $none, 95, 'X570 boards have a chipset fan; check it spins and is not clogged.', $true) }
-        if ($n -match '^(CPU|System|Motherboard|T_Sensor|Water)') { return @(10, 80, $none, 95, 'Board-level temperatures this high point at case airflow.', $true) }
-        return
-    }
-    if ($s.Type -eq 'Voltage') {
-        $nom = Get-RailNominal $n
-        if ($nom -gt 0 -and $s.HwType -ne 'Cpu') {
-            if ([math]::Abs(100 * ($s.Value - $nom) / $nom) -gt 15) { return }
-            return @(($nom * 0.95), ($nom * 1.05), ($nom * 0.92), ($nom * 1.08), '', $false)
-        }
-        if ($n -match 'VBAT|CMOS') { return @(2.7, 3.4, $none, 1e9, '', $false) }
-        if ($n -match 'SoC') { return @(0.85, 1.25, $none, 1.35, 'On Ryzen, SoC voltage above about 1.25 V risks long-term degradation and is a known cause of memory instability. It is normally set by the XMP / EXPO profile or by hand in the BIOS.', $true) }
-        if ($n -match 'DRAM|DIMM') { return @(1.05, 1.5, $none, 1.6, 'DDR4 XMP profiles run at 1.35-1.5 V and DDR5 at 1.25-1.45 V. More than that needs active cooling and shortens module life.', $true) }
-        if ($n -match 'SVI2|Vcore|CPU Core$|^Core$') { return @(0.2, 1.5, $none, 1.55, 'AMD specifies 1.55 V as the absolute maximum core voltage. Brief peaks near 1.5 V at light load are normal for Ryzen; sustained readings above that usually come from a manual voltage or aggressive PBO setting.', $true) }
-        return
-    }
-    if ($s.Type -eq 'Fan' -and $n -match 'CPU' -and $n -notmatch 'OPT|Pump') {
-        return @(1, 1e9, $none, 1e9, 'Nothing is spinning on the CPU fan header. Expected if an AIO pump or fan hub is connected elsewhere; otherwise the CPU cooler fan has stopped.', $true)
-    }
-    return
-}
-function Get-SensorUnit([string]$type) {
-    switch ($type) {
-        'Temperature' { return ' C' } 'Voltage' { return ' V' } 'Fan' { return ' RPM' } 'Clock' { return ' MHz' } 'Power' { return ' W' }
-        'Load' { return ' %' } 'Level' { return ' %' } 'Control' { return ' %' } 'Data' { return ' GB' } 'SmallData' { return ' MB' }
-        'Current' { return ' A' } 'Throughput' { return ' B/s' } 'Frequency' { return ' Hz' }
-    }
-    return ''
-}
-# Returns @(severity, assessment text, finding detail or '', expected-range text)
-function Get-SensorVerdict($s) {
-    if (-not $s.Valid) { $t = 'Invalid reading, ignored'; if ($s.Note) { $t = $s.Note }; return @('info', $t, '', '') }
-    $sp = @(Get-SensorSpec $s)
-    if ($sp.Count -eq 0) {
-        $why = ''
-        if ($s.Type -eq 'Temperature' -and $s.Name -match $script:RefSensor) { $why = 'Reference value, not a reading' }
-        elseif ($s.Type -eq 'Temperature' -and $s.Name -match '^Temperature( #\d+)?$') { $why = 'Not judged: unlabelled input on the sensor chip' }
-        elseif ($s.Type -eq 'Voltage' -and (Get-RailNominal $s.Name) -gt 0 -and $s.HwType -ne 'Cpu') { $why = 'Not judged: not a correctly scaled rail reading' }
-        elseif ($s.Type -in 'Temperature', 'Voltage') { $why = 'Not judged: no known range for this sensor' }
-        return @('', $why, '', '')
-    }
-    $u = Get-SensorUnit $s.Type
-    if ($sp[1] -ge 1e9) { $range = ('above {0:0.##}{1}' -f ($sp[0] - 1), $u) } else { $range = ('{0:0.##} to {1:0.##}{2}' -f $sp[0], $sp[1], $u) }
-    $detail = ''; if ($sp[5]) { $detail = $sp[4] }
-    $sev = ''; $txt = ''
-    if ($s.Max -ge $sp[3]) { $sev = 'crit'; $txt = ('{0:0.##}{1} is beyond the safe limit of {2:0.##}{1}' -f $s.Max, $u, $sp[3]) }
-    elseif ($s.Min -le $sp[2]) { $sev = 'crit'; $txt = ('{0:0.##}{1} is below the safe limit of {2:0.##}{1}' -f $s.Min, $u, $sp[2]) }
-    elseif ($s.Max -gt $sp[1]) { $sev = 'warn'; $txt = ('{0:0.##}{1} is above the expected range' -f $s.Max, $u) }
-    elseif ($s.Min -lt $sp[0]) { $sev = 'warn'; $txt = ('{0:0.##}{1} is below the expected range' -f $s.Min, $u) }
-    if ($sev) {
-        if ($s.HwType -eq 'SuperIO') {
-            # single unconfirmed source: report it, but as something to verify rather than a fault
-            $sev = 'warn'; $txt += '. Low-confidence source (board sensor chip): confirm in the BIOS before acting'
-        }
-        return @($sev, $txt, $detail, $range)
-    }
-    return @('ok', 'Within expected range', '', $range)
 }
 
 # ---------------------------------------------------------------------- CPU
@@ -454,16 +397,18 @@ Invoke-Step 'CPU' {
     }
 
     if ($cpu) {
-        if ($cpu.Name -match 'X3D') { $script:CpuTjMax = 89 }
-        elseif ($cpu.Name -match 'Ryzen \d+ 5\d{3}') { $script:CpuTjMax = 90 }
-        elseif ($cpu.Name -match 'Intel') { $script:CpuTjMax = 100 }
+        $script:CpuTjMax = Get-CpuTjMax ([string]$cpu.Name)
         Add-Fact 'cpu' 'Thermal limit assumed (TjMax)' ('{0} C' -f $script:CpuTjMax)
     }
     $temps = Get-Sens '^Cpu$' 'Temperature'
+    if ($temps.Count -eq 0) {
+        Add-Finding 'cpu' 'gap' 'CPU temperature could not be read' $(if ($script:SensorNote) { $script:SensorNote } else { 'The sensor library returned no valid CPU temperature. See the Motherboard section for the reason.' }) '' ''
+    }
     if ($temps.Count -gt 0) {
         $pkg = $temps | Where-Object { $_.Name -match 'Package|Tctl|Tdie|Core Max|CPU$' } | Sort-Object Max -Descending | Select-Object -First 1
         if (-not $pkg) { $pkg = $temps | Sort-Object Max -Descending | Select-Object -First 1 }
-        $sev = Get-TempSev $pkg.Max ($script:CpuTjMax - 5) ($script:CpuTjMax + 3)
+        $vd = Get-SensorVerdict $pkg $script:Sensors
+        $sev = 'ok'; if ($vd[0] -in 'warn', 'crit') { $sev = $vd[0] }
         Add-Gauge 'cpu' ('Temperature ({0})' -f $pkg.Name) $pkg.Max 'C' 110 $sev $(if ($script:Watched) { 'Peak over the {0}-minute watch (lowest {1:N0} C)' -f $WatchMinutes, $pkg.Min } else { 'Snapshot at current load, not a stress test' })
         if ($sev -ne 'ok') {
             Add-Finding 'cpu' $sev ('CPU reached {0:N0} C' -f $pkg.Max) `
@@ -517,10 +462,14 @@ Invoke-Step 'GPU' {
     Add-Table 'gpu' 'Adapters' @('Adapter', 'Driver version', 'Driver date', 'Mode', 'Status') $rows '' $false
 
     $gt = Get-Sens '^Gpu' 'Temperature'
+    if ($gt.Count -eq 0 -and $script:Gpus.Count -gt 0) {
+        Add-Finding 'gpu' 'gap' 'GPU temperature could not be read' $(if ($script:SensorNote) { $script:SensorNote } else { 'The sensor library returned no GPU temperature.' }) '' ''
+    }
     foreach ($hwName in @($gt | Select-Object -ExpandProperty Hw -Unique)) {
         $t = $gt | Where-Object { $_.Hw -eq $hwName -and $_.Name -notmatch 'Hot ?Spot' } | Sort-Object Max -Descending | Select-Object -First 1
         if (-not $t) { continue }
-        $sev = Get-TempSev $t.Max 88 100
+        $vd = Get-SensorVerdict $t $script:Sensors
+        $sev = 'ok'; if ($vd[0] -in 'warn', 'crit') { $sev = $vd[0] }
         Add-Gauge 'gpu' ('{0} - {1}' -f $hwName, $t.Name) $t.Max 'C' 110 $sev $(if ($script:Watched) { 'Peak over the {0}-minute watch' -f $WatchMinutes } else { 'Snapshot at current load' })
         if ($sev -ne 'ok') {
             Add-Finding 'gpu' $sev ('{0} reached {1:N0} C' -f $hwName, $t.Max) 'That is high for a system that is not under a deliberate load.' `
@@ -585,7 +534,8 @@ Invoke-Step 'Memory' {
             'WHEA recorded memory errors. On consumer (non-ECC) systems this is uncommon and worth acting on.' `
             'Run Windows Memory Diagnostic or MemTest86 once, with XMP/EXPO disabled, to separate bad memory from an unstable profile.' ''
     }
-    $diag = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } -MaxEvents 1 -ErrorAction SilentlyContinue
+    $diag = $null
+    try { $diag = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } -MaxEvents 1 -ErrorAction Stop } catch {}
     if ($diag) {
         Add-Fact 'memory' 'Last Windows Memory Diagnostic' ('{0}: {1}' -f (Format-Day $diag.TimeCreated), (Get-Short $diag.Message 160))
     } else {
@@ -615,7 +565,7 @@ Invoke-Step 'Drives' {
         }
         $wear = ''; $temp = ''; $hours = ''; $errs = ''; $written = ''
         # the drive's own SMART attributes as read by LibreHardwareMonitor, matched on model name
-        $ls = @($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Valid -and ($_.Hw -eq $name -or $_.Hw -like "*$name*" -or $name -like ('*' + $_.Hw + '*')) })
+        $ls = @(Select-DriveSensors $script:Sensors $name $d.DeviceId)
         $wr = $ls | Where-Object { $_.Name -match 'Data Written|Total Bytes Written|Host Writes' } | Select-Object -First 1
         if ($wr) { if ($wr.Value -ge 1000) { $written = ('{0:N1} TB' -f ($wr.Value / 1000)) } else { $written = ('{0:N0} GB' -f $wr.Value) } }
         $pct = $null
@@ -637,10 +587,11 @@ Invoke-Step 'Drives' {
         if ($r) {
             if ($r.Temperature) {
                 $temp = ('{0} C' -f $r.Temperature)
-                $limit = 65; if ($d.MediaType -eq 'HDD') { $limit = 55 }
+                $driveId = ''; if ($ls.Count -gt 0) { $driveId = [string]$ls[0].Id } elseif ($d.MediaType -eq 'HDD') { $driveId = '/hdd/' }
+                $lim = Get-DriveTempLimits $script:Sensors $driveId
                 $ownW = $ls | Where-Object { $_.Type -eq 'Temperature' -and $_.Name -match 'Warning' -and $_.Value -gt 40 } | Select-Object -First 1
-                if ($ownW) { $limit = $ownW.Value - 5; $temp = ('{0} C (drive''s own warning limit {1:N0} C)' -f $r.Temperature, $ownW.Value) }
-                if ($r.Temperature -ge $limit) {
+                if ($ownW) { $temp = ('{0} C (drive''s own warning limit {1:N0} C)' -f $r.Temperature, $ownW.Value) }
+                if ($r.Temperature -ge ($lim[0] - 5)) {
                     Add-Finding 'drives' 'warn' ('{0} is at {1} C' -f $name, $r.Temperature) 'That is close to the temperature at which the drive starts throttling itself.' 'Check airflow over the drive; M.2 drives under a GPU often benefit from a heatsink.' ''
                 }
             }
@@ -665,7 +616,7 @@ Invoke-Step 'Drives' {
     Add-Table 'drives' 'SMART detail per drive' @('Drive', 'Attribute', 'Kind', 'Value') $smart 'Kinds: Level = percent, Data = gigabytes, Temperature = Celsius.' $true
     if ($disks.Count -eq 0) { Add-Finding 'drives' 'info' 'Could not enumerate physical drives' 'Get-PhysicalDisk returned nothing; run elevated.' '' '' }
 
-    foreach ($p in (Get-Cim 'MSStorageDriver_FailurePredictStatus' 'root\wmi')) {
+    foreach ($p in (Get-Cim 'MSStorageDriver_FailurePredictStatus' 'root\wmi' '' -Optional)) {
         if ($p.PredictFailure) {
             Add-Finding 'drives' 'crit' 'A drive is predicting its own failure (SMART)' ('Instance: {0}' -f $p.InstanceName) 'Back up immediately and replace the drive.' ''
         }
@@ -718,16 +669,17 @@ Invoke-Step 'Power supply' {
         $nominal = Get-RailNominal $v.Name
         $cell = New-Cell '-' '' ''
         if ($nominal -gt 0) {
-            $devLo = 100 * ($v.Min - $nominal) / $nominal; $devHi = 100 * ($v.Max - $nominal) / $nominal
-            $dev = $devLo; if ([math]::Abs($devHi) -gt [math]::Abs($devLo)) { $dev = $devHi }
-            if ([math]::Abs($dev) -le 15) {
+            $vd = Get-SensorVerdict $v $script:Sensors
+            if ($vd[0] -in 'ok', 'warn', 'crit') {
                 $judged++
-                $sev = 'ok'; if ([math]::Abs($dev) -gt 8) { $sev = 'crit' } elseif ([math]::Abs($dev) -gt 5) { $sev = 'warn' }
-                if ($sev -eq 'crit' -and $v.HwType -eq 'SuperIO') { $sev = 'warn' }   # one unconfirmed source never raises a critical
-                $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V at worst' -f $dev, $nominal) $sev ''
-                if ($sev -ne 'ok') {
-                    Add-Finding 'psu' $sev ('{0} rail reached {1:+0.0;-0.0} % from nominal (range {2:N2} to {3:N2} V)' -f $v.Name, $dev, $v.Min, $v.Max) `
-                        'The ATX specification allows +/-5 %. Motherboard sensor readings are approximate, so treat this as a prompt to verify, not proof.' `
+                $devLo = 100 * ($v.Min - $nominal) / $nominal; $devHi = 100 * ($v.Max - $nominal) / $nominal
+                $dev = $devLo; if ([math]::Abs($devHi) -gt [math]::Abs($devLo)) { $dev = $devHi }
+                $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V at worst' -f $dev, $nominal) $vd[0] ''
+                if ($vd[0] -ne 'ok') {
+                    $extra = ''
+                    if ([math]::Abs($dev) -gt 15) { $extra = ' A deviation this large is either a severe fault or an input that is not wired the way its label suggests; the BIOS reading settles which.' }
+                    Add-Finding 'psu' $vd[0] ('{0} rail reached {1:+0.0;-0.0} % from nominal (range {2:N2} to {3:N2} V)' -f $v.Name, $dev, $v.Min, $v.Max) `
+                        ('The ATX specification allows +/-5 %. {0}.{1}' -f $vd[1], $extra) `
                         'Confirm in the BIOS hardware monitor or with a multimeter before replacing anything.' ''
                 }
                 if ($script:Watched -and $nominal -eq 12) {
@@ -743,9 +695,6 @@ Invoke-Step 'Power supply' {
             } else {
                 $cell = New-Cell 'not a scaled rail reading' '' ''
             }
-        }
-        if ($v.Name -match 'VBAT|CMOS|Battery' -and $v.Value -gt 0.5 -and $v.Value -lt 2.7) {
-            Add-Finding 'board' 'warn' ('CMOS battery reads {0:N2} V' -f $v.Value) 'A CR2032 below about 2.7 V is near the end of its life; the symptom is the clock and BIOS settings resetting.' 'Replace the CR2032 coin cell.' ''
         }
         $reading = ('{0:N3} V' -f $v.Value); if ($script:Watched) { $reading = ('{0:N3} to {1:N3} V' -f $v.Min, $v.Max) }
         [void]$rows.Add(@([string]$v.Hw, [string]$v.Name, $reading, $cell))
@@ -765,7 +714,7 @@ Invoke-Step 'Power supply' {
     if ($judged -eq 0) {
         $why = 'No labelled voltage rails were readable.'
         if ($script:SensorNote) { $why = $script:SensorNote }
-        Add-Finding 'psu' 'info' 'No voltage rail readings available' $why 'The BIOS hardware monitor page shows the same rails if you want to check them by eye.' ''
+        Add-Finding 'psu' 'gap' 'Voltage rails could not be checked' $why 'The BIOS hardware monitor page shows the same rails if you want to check them by eye.' ''
     } elseif (@($script:Areas['psu'].findings | Where-Object { $_.sev -in 'warn', 'crit' }).Count -eq 0) {
         Add-Finding 'psu' 'ok' ('{0} voltage rail reading(s) within ATX tolerance' -f $judged) 'Measured at the current (light) load.' '' ''
     }
@@ -793,8 +742,8 @@ Invoke-Step 'Power supply' {
     }
 
     foreach ($b in (Get-Cim 'Win32_Battery')) {
-        $full = (Get-Cim 'BatteryFullChargedCapacity' 'root\wmi' | Select-Object -First 1).FullChargedCapacity
-        $design = (Get-Cim 'BatteryStaticData' 'root\wmi' | Select-Object -First 1).DesignedCapacity
+        $full = (Get-Cim 'BatteryFullChargedCapacity' 'root\wmi' '' -Optional | Select-Object -First 1).FullChargedCapacity
+        $design = (Get-Cim 'BatteryStaticData' 'root\wmi' '' -Optional | Select-Object -First 1).DesignedCapacity
         if ($full -and $design) {
             $pct = 100 * $full / $design
             $sev = 'ok'; if ($pct -lt 50) { $sev = 'crit' } elseif ($pct -lt 70) { $sev = 'warn' }
@@ -860,11 +809,11 @@ Invoke-Step 'Motherboard' {
             'For the cleanest readings, close these (including their tray icons and services) and re-run.' ''
     }
     $boardT = Get-Sens 'SuperIO|Motherboard|EmbeddedController' 'Temperature'
-    foreach ($t in ($boardT | Where-Object { @(Get-SensorSpec $_).Count -gt 0 } | Sort-Object Max -Descending | Select-Object -First 4)) {
-        $vd = Get-SensorVerdict $t
+    foreach ($t in ($boardT | Where-Object { @(Get-SensorSpec $_ $script:Sensors).Count -gt 0 } | Sort-Object Max -Descending | Select-Object -First 4)) {
+        $vd = Get-SensorVerdict $t $script:Sensors
         Add-Gauge 'board' ('{0} temperature' -f $t.Name) $t.Max 'C' 110 $(if ($vd[0] -in 'warn', 'crit') { $vd[0] } else { 'ok' }) ('Expected {0}. Read from {1}' -f $vd[3], $t.Hw)
     }
-    $mystery = @($boardT | Where-Object { @(Get-SensorSpec $_).Count -eq 0 -and $_.Max -ge 80 })
+    $mystery = @($boardT | Where-Object { @(Get-SensorSpec $_ $script:Sensors).Count -eq 0 -and $_.Max -ge 80 })
     if ($mystery.Count -gt 0) {
         Add-Finding 'board' 'info' ('{0} unidentified sensor input(s) read above 80 C and were not judged' -f $mystery.Count) `
             ('{0}. These are numbered inputs on the board''s sensor chip ({1}) that the sensor library cannot name, because board makers do not publish which input is wired to what. The chip has more inputs than most boards use, and an unconnected input floats at a meaningless, often high and steady, value. That is the likely explanation here, but it cannot be proven from software.' -f (($mystery | ForEach-Object { '{0} = {1:N0} C' -f $_.Name, $_.Max }) -join ', '), $mystery[0].Hw) `
@@ -873,7 +822,7 @@ Invoke-Step 'Motherboard' {
     $srows = New-Rows
     $flagged = New-Rows
     foreach ($s in ($script:Sensors | Sort-Object HwType, Hw, Type, Name)) {
-        $vd = Get-SensorVerdict $s
+        $vd = Get-SensorVerdict $s $script:Sensors
         $u = Get-SensorUnit $s.Type
         $cellV = New-Cell $vd[1] $vd[0] ''
         $range = $vd[3]; if (-not $range) { $range = '-' }
@@ -896,15 +845,15 @@ Invoke-Step 'Motherboard' {
 
     if ($script:LowLevelBroken) {
         $pawn = Get-Service -Name 'PawnIO' -ErrorAction SilentlyContinue
-        Add-Finding 'board' 'warn' 'CPU and motherboard sensor readings are invalid and were ignored' `
+        Add-Finding 'board' 'gap' 'CPU and motherboard sensor readings are invalid and were ignored' `
             ('The sensor library listed the sensors but every value is a placeholder (0 C, 0 W, an identical 1.55 V on every core). That happens when it has no low-level access to the CPU and the board''s sensor chip, so temperatures, fan speeds and the 12 V / 5 V / 3.3 V rails could not be assessed. PawnIO driver installed: {0}.' -f $(if ($pawn) { 'yes' } else { 'no' })) `
             'Install the PawnIO driver (pawnio.eu, or: winget install namazso.PawnIO), restart, and re-run. If it is already installed, Windows Security > Core isolation > Memory integrity or an anti-cheat service may be blocking it.' 'https://pawnio.eu/'
     } elseif ($script:Sensors.Count -gt 0 -and (Get-Sens 'SuperIO' 'Voltage').Count -eq 0 -and (Get-Sens '^Cpu$' 'Temperature').Count -eq 0) {
-        Add-Finding 'board' 'info' 'CPU and motherboard sensors were not readable' `
+        Add-Finding 'board' 'gap' 'CPU and motherboard sensors were not readable' `
             'LibreHardwareMonitor returned data for some devices but not the CPU or the board sensor chip. Recent LibreHardwareMonitor releases need the separate PawnIO driver for low-level access, and some anti-cheat or core-isolation settings block it.' `
             'Install PawnIO from pawnio.eu and re-run if you want temperatures and voltage rails.' 'https://pawnio.eu/'
     } elseif ($script:Sensors.Count -eq 0 -and $script:SensorNote) {
-        Add-Finding 'board' 'info' 'No sensor data in this report' $script:SensorNote '' ''
+        Add-Finding 'board' 'gap' 'No sensor data in this report' $script:SensorNote '' ''
     }
 }
 
@@ -1052,8 +1001,9 @@ Invoke-Step 'Windows installation' {
                         foreach ($k in $script:StorePackages.Keys) { if ($pkg -match $k) { $what = $script:StorePackages[$k] + ' It is a Microsoft Store package, so DISM and SFC do not cover it and a clean deep scan says nothing about it.'; break } }
                         $inst = @(); $users = @()
                         try {
-                            $inst = @(Get-AppxPackage -AllUsers -Name ($pkg + '*') -ErrorAction Stop)
-                            $users = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { @($_.Dependencies | Where-Object { $_.Name -like ($pkg + '*') }).Count -gt 0 } | ForEach-Object { $_.Name } | Select-Object -Unique)
+                            if ($null -eq $script:AppxAll) { $script:AppxAll = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+                            $inst = @($script:AppxAll | Where-Object { $_.Name -like ($pkg + '*') })
+                            $users = @($script:AppxAll | Where-Object { @($_.Dependencies | Where-Object { $_.Name -like ($pkg + '*') }).Count -gt 0 } | ForEach-Object { $_.Name } | Select-Object -Unique)
                         } catch {}
                         if ($inst.Count -gt 0) {
                             $state = 'Installed now: version ' + ((($inst | ForEach-Object { [string]$_.Version } | Select-Object -Unique)) -join ', ') + '.'
@@ -1096,7 +1046,7 @@ Invoke-Step 'Windows installation' {
         if ($mp.AntivirusEnabled -and -not $mp.RealTimeProtectionEnabled) { Add-Finding 'windows' 'warn' 'Defender real-time protection is off' '' 'Turn it back on in Windows Security unless another antivirus is in charge.' '' }
         if ($mp.AntivirusEnabled -and $mp.AntivirusSignatureAge -gt 7) { Add-Finding 'windows' 'warn' ('Defender signatures are {0} days old' -f $mp.AntivirusSignatureAge) '' 'Check for updates in Windows Security.' '' }
     } catch {
-        $av = @(Get-Cim 'AntiVirusProduct' 'root\SecurityCenter2' | ForEach-Object { $_.displayName })
+        $av = @(Get-Cim 'AntiVirusProduct' 'root\SecurityCenter2' '' -Optional | ForEach-Object { $_.displayName })
         if ($av.Count -gt 0) { Add-Fact 'windows' 'Antivirus' ($av -join ', ') }
     }
 
@@ -1110,34 +1060,6 @@ Invoke-Step 'Windows installation' {
 }
 
 # ----------------------------------------------------------- crash analysis
-# code = name, suspect area, plain-English meaning
-$script:Bugchecks = @{
-    0x124 = @('WHEA_UNCORRECTABLE_ERROR', 'Hardware', 'The CPU reported a fatal hardware error. Almost never software: an unstable overclock, undervolt or memory profile, overheating, or a failing CPU, PSU or motherboard.')
-    0x101 = @('CLOCK_WATCHDOG_TIMEOUT', 'CPU', 'A CPU core stopped responding. Typical of an unstable overclock, undervolt or Curve Optimizer setting; occasionally a failing CPU.')
-    0x116 = @('VIDEO_TDR_FAILURE', 'GPU', 'The graphics driver hung and could not be reset. Graphics driver, GPU overheating or instability, or insufficient power to the card.')
-    0x117 = @('VIDEO_TDR_TIMEOUT_DETECTED', 'GPU', 'The graphics driver took too long to respond.')
-    0x119 = @('VIDEO_SCHEDULER_INTERNAL_ERROR', 'GPU', 'The graphics scheduler hit a fatal error. Graphics driver or failing GPU.')
-    0x10E = @('VIDEO_MEMORY_MANAGEMENT_INTERNAL', 'GPU', 'Graphics memory manager error. Graphics driver or GPU memory.')
-    0x1A = @('MEMORY_MANAGEMENT', 'Memory', 'Windows found its memory bookkeeping corrupted. Faulty or unstable RAM (XMP/EXPO), less often a driver.')
-    0x4E = @('PFN_LIST_CORRUPT', 'Memory', 'Memory page list corrupted. Faulty or unstable RAM, or a driver writing where it should not.')
-    0x12B = @('FAULTY_HARDWARE_CORRUPTED_PAGE', 'Memory', 'A memory page changed when nothing should have touched it. Strongly suggests faulty RAM.')
-    0x50 = @('PAGE_FAULT_IN_NONPAGED_AREA', 'Driver or memory', 'Something referenced memory that does not exist. A buggy driver or faulty RAM.')
-    0x0A = @('IRQL_NOT_LESS_OR_EQUAL', 'Driver or memory', 'A driver touched memory at the wrong priority level. Buggy driver, or faulty RAM.')
-    0xD1 = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'Driver', 'A driver touched invalid memory. The dump normally names the driver; network and storage drivers are common.')
-    0x3B = @('SYSTEM_SERVICE_EXCEPTION', 'Driver', 'A system call crashed in kernel code. Usually a driver (graphics and antivirus are common).')
-    0x7E = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'Driver', 'A driver thread crashed. The dump normally names the driver.')
-    0x1E = @('KMODE_EXCEPTION_NOT_HANDLED', 'Driver or memory', 'Kernel code hit an error it did not handle. A driver, or faulty RAM.')
-    0x9F = @('DRIVER_POWER_STATE_FAILURE', 'Driver', 'A driver did not complete a sleep, wake or shutdown transition. Usually network, USB or graphics drivers.')
-    0x133 = @('DPC_WATCHDOG_VIOLATION', 'Driver or storage', 'A driver held the CPU too long. Storage controller or SSD firmware, or network and graphics drivers.')
-    0x139 = @('KERNEL_SECURITY_CHECK_FAILURE', 'Driver or memory', 'Kernel data structure corruption detected. A driver bug or faulty RAM.')
-    0xEF = @('CRITICAL_PROCESS_DIED', 'Windows or storage', 'A process Windows cannot run without died. Corrupt system files, or a failing system drive.')
-    0x7A = @('KERNEL_DATA_INPAGE_ERROR', 'Storage', 'Windows could not read its own data back from disk. Failing drive, cable or storage controller.')
-    0xF4 = @('CRITICAL_OBJECT_TERMINATION', 'Storage', 'A critical process ended, most often because the system drive stopped responding.')
-    0x7B = @('INACCESSIBLE_BOOT_DEVICE', 'Storage', 'Windows lost access to the boot drive. Storage driver, controller mode change or failing drive.')
-    0x154 = @('UNEXPECTED_STORE_EXCEPTION', 'Storage', 'The memory compression store failed, most often because the system drive stalled.')
-    0xC2 = @('BAD_POOL_CALLER', 'Driver', 'A driver made an invalid memory pool request.')
-    0x19 = @('BAD_POOL_HEADER', 'Driver or memory', 'Kernel memory pool corrupted. A driver, or faulty RAM.')
-}
 function Test-Near($ev, [datetime]$from, [datetime]$to) { return @($ev | Where-Object { $_.TimeCreated -ge $from -and $_.TimeCreated -le $to }) }
 
 Invoke-Step 'Crash analysis' {
@@ -1159,7 +1081,7 @@ Invoke-Step 'Crash analysis' {
 
     $rows = New-Rows
     $codes = @(); $areasHit = @(); $usedBc = @{}
-    foreach ($e in $kp) {
+    foreach ($e in ($kp | Sort-Object TimeCreated)) {
         $T = $e.TimeCreated
         $code = 0; try { $code = [int64]$e.Properties[0].Value } catch {}
         # Event 41 is written at the NEXT boot. Find the last thing logged before that boot to date the crash itself.
@@ -1168,7 +1090,7 @@ Invoke-Step 'Crash analysis' {
         $alive = $bootStart
         try { $last = Get-WinEvent -FilterHashtable @{ LogName = 'System'; EndTime = $bootStart.AddSeconds(-2) } -MaxEvents 1 -ErrorAction Stop; if ($last) { $alive = $last.TimeCreated } } catch {}
 
-        $dumpEv = $bc | Where-Object { $_.TimeCreated -ge $T.AddMinutes(-2) -and $_.TimeCreated -le $T.AddMinutes(30) } | Select-Object -First 1
+        $dumpEv = Select-NearestRecord $bc $T $usedBc 2 30
         $dump = ''
         if ($dumpEv) {
             $usedBc[$dumpEv.RecordId] = 1
@@ -1187,9 +1109,7 @@ Invoke-Step 'Crash analysis' {
         if ($ev.Count -eq 0) { $ev += 'No related warnings logged beforehand' }
 
         if ($code -ne 0) {
-            $k = $code; if ($k -ge 0x10000000 -and $k -lt 0x20000000) { $k = $k - 0x10000000 }
-            $info = $null; if ($k -le 0x7FFFFFFF) { $info = $script:Bugchecks[[int]$k] }
-            if (-not $info) { $info = @('(not in built-in table)', 'Unknown', 'Search this bugcheck code on Microsoft Learn for its meaning.') }
+            $info = Resolve-Bugcheck $code
             $type = New-Cell 'Blue screen' 'crit' ''
             $codeTxt = ('0x{0:X} {1}' -f $code, $info[0]); $suspect = $info[1]; $cause = $info[2]
             if ($w.Count -gt 0 -and $suspect -notmatch 'Hardware|CPU') { $cause += ' Hardware error records were logged around this crash, which shifts suspicion toward hardware.' }
@@ -1206,8 +1126,7 @@ Invoke-Step 'Crash analysis' {
     }
     foreach ($b in ($bc | Where-Object { -not $usedBc.ContainsKey($_.RecordId) })) {
         $code = 0; if ($b.Message -match '0x([0-9a-fA-F]{8})') { $code = [Convert]::ToInt64($Matches[1], 16) }
-        $info = $null; if ($code -le 0x7FFFFFFF) { $info = $script:Bugchecks[[int]$code] }
-        if (-not $info) { $info = @('', 'Unknown', (Get-Short $b.Message 200)) }
+        $info = Resolve-Bugcheck $code
         $codes += $code; $areasHit += $info[1]
         [void]$rows.Add(@((Format-Stamp $b.TimeCreated), (New-Cell 'Blue screen' 'crit' ''), ('0x{0:X} {1}' -f $code, $info[0]), $info[1], $info[2], '', ''))
     }
@@ -1287,11 +1206,6 @@ Invoke-Step 'Crash analysis' {
 # AMD publishes one page per product; the index page embeds the full list of them.
 $script:AmdIndex = $null
 $script:AmdNewest = ''
-function Get-MaxVer([string]$text, [string]$pattern) {
-    $best = $null; $bestText = ''
-    foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { $v = ConvertTo-Ver $m.Groups[1].Value; if ($v -and (-not $best -or $v -gt $best)) { $best = $v; $bestText = $m.Groups[1].Value } }
-    return $bestText
-}
 function Get-AmdIndex {
     if ($null -eq $script:AmdIndex) {
         $h = Get-Web 'https://www.amd.com/en/support/download/drivers.html'
@@ -1299,10 +1213,6 @@ function Get-AmdIndex {
         $script:AmdNewest = Get-MaxVer $h 'adrenalin-edition-(\d{2}\.\d{1,2}\.\d{1,2})'
     }
     return $script:AmdIndex
-}
-function Get-AmdSlug([string]$name) {
-    $s = $name.ToLower() -replace '\((tm|r)\)', ' ' -replace '\s+\d+-core processor.*$', '' -replace '\s+with radeon.*$', '' -replace '\s+series$', ''
-    return (($s -replace '[^a-z0-9]+', '-').Trim('-'))
 }
 function Find-AmdPage([string]$section, [string]$slug) {
     if (-not $slug) { return '' }
@@ -1329,7 +1239,6 @@ function Get-InstalledProgram([string]$namePattern) {
 function Add-Link([string]$what, [string]$source, [string]$url, [string]$why) {
     [void]$script:Links.Add(@($what, (New-Cell $source '' $url), $why))
 }
-function ConvertTo-Ver([string]$s) { try { return [version]$s } catch { return $null } }
 
 Invoke-Step 'Drivers' {
     $keyClasses = 'DISPLAY', 'NET', 'MEDIA', 'BLUETOOTH', 'SYSTEM', 'HDC', 'SCSIADAPTER', 'USB', 'MONITOR', 'HIDCLASS', 'MOUSE', 'KEYBOARD', 'CAMERA', 'AUDIOENDPOINT', 'SOFTWARECOMPONENT', 'EXTENSION', 'FIRMWARE', 'BIOMETRIC'
@@ -1658,24 +1567,13 @@ Invoke-Step 'Drivers' {
 }
 
 # ----------------------------------------------------------------- assemble
-$rank = @{ ok = 0; info = 0; warn = 1; crit = 2 }
-$overall = 'ok'
 $areaList = New-Object System.Collections.ArrayList
 foreach ($a in $script:Areas.Values) {
-    $worst = 'ok'; $w = 0; $c = 0; $i = 0
-    foreach ($f in $a.findings) {
-        if ($f.sev -eq 'warn') { $w++ } elseif ($f.sev -eq 'crit') { $c++ } elseif ($f.sev -eq 'info') { $i++ }
-        if ($rank[$f.sev] -gt $rank[$worst]) { $worst = $f.sev }
-    }
-    $a.status = $worst
-    if ($c -gt 0) { $a.summary = ('{0} critical, {1} warning' -f $c, $w) }
-    elseif ($w -gt 0) { $a.summary = ('{0} warning(s)' -f $w) }
-    elseif ($a.findings.Count -eq 0) { $a.status = 'unknown'; $a.summary = 'No data collected' }
-    elseif ($i -gt 0) { $a.summary = ('No problems found, {0} note(s)' -f $i) }
-    else { $a.summary = 'No problems found' }
-    if ($rank.ContainsKey($a.status) -and $rank[$a.status] -gt $rank[$overall]) { $overall = $a.status }
+    $st = Get-AreaStatus $a.findings
+    $a.status = $st[0]; $a.summary = $st[1]
     [void]$areaList.Add($a)
 }
+$overall = Get-OverallStatus @($areaList | ForEach-Object { $_.status })
 
 $errList = New-Object System.Collections.ArrayList
 foreach ($e in $script:Errors) { [void]$errList.Add([string]$e) }

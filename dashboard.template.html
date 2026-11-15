@@ -38,7 +38,7 @@ a { color: var(--link); }
 .dot { display: inline-flex; align-items: center; justify-content: center; flex: none;
   width: 20px; height: 20px; border-radius: 50%; font-size: 12px; font-weight: 700; line-height: 1; color: #fff; }
 .dot.ok { background: var(--good); } .dot.warn { background: var(--warning); color: #0b0b0b; }
-.dot.crit { background: var(--critical); } .dot.info { background: var(--note); } .dot.unknown { background: var(--unknown); }
+.dot.crit { background: var(--critical); } .dot.info { background: var(--note); } .dot.unknown, .dot.limited, .dot.gap { background: var(--unknown); }
 .chip { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; white-space: nowrap; }
 
 .hero { display: flex; gap: 18px; align-items: center; background: var(--surface); border: 1px solid var(--line);
@@ -99,9 +99,9 @@ footer li { margin: 2px 0; }
 <script>
 var REPORT = /*__REPORT_DATA__*/null;
 (function () {
-  var LABEL = { ok: 'Healthy', info: 'Note', warn: 'Attention', crit: 'Critical', unknown: 'No data' };
-  var ICON = { ok: '✓', info: 'i', warn: '!', crit: '✕', unknown: '?' };
-  var ORDER = { crit: 0, warn: 1, info: 2, ok: 3 };
+  var LABEL = { ok: 'Healthy', info: 'Note', warn: 'Attention', crit: 'Critical', unknown: 'No data', limited: 'Partly checked', gap: 'Not checked' };
+  var ICON = { ok: '✓', info: 'i', warn: '!', crit: '✕', unknown: '?', limited: '–', gap: '?' };
+  var ORDER = { crit: 0, warn: 1, gap: 2, info: 3, ok: 4 };
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -165,12 +165,12 @@ var REPORT = /*__REPORT_DATA__*/null;
   app.appendChild(el('h1', '', 'PC Health – ' + m.computer));
   app.appendChild(el('div', 'sub', 'Scanned ' + m.generated + ' · event logs for the last ' + m.days + ' days · passive read-only checks, no stress testing'));
 
-  var nCrit = 0, nWarn = 0;
-  areas.forEach(function (a) { a.findings.forEach(function (f) { if (f.sev === 'crit') nCrit++; if (f.sev === 'warn') nWarn++; }); });
+  var nCrit = 0, nWarn = 0, nGap = 0;
+  areas.forEach(function (a) { a.findings.forEach(function (f) { if (f.sev === 'crit') nCrit++; if (f.sev === 'warn') nWarn++; if (f.sev === 'gap') nGap++; }); });
   var hero = el('div', 'hero'); hero.appendChild(dot(m.overall));
   var ht = el('div');
-  ht.appendChild(el('div', 'big', m.overall === 'crit' ? 'Critical problems found' : m.overall === 'warn' ? 'Some items need attention' : 'No problems found'));
-  ht.appendChild(el('div', 'sub', nCrit + ' critical · ' + nWarn + ' warning' + (nWarn === 1 ? '' : 's') + ' across ' + areas.length + ' areas'));
+  ht.appendChild(el('div', 'big', m.overall === 'crit' ? 'Critical problems found' : m.overall === 'warn' ? 'Some items need attention' : nGap ? 'No problems found in what could be checked' : 'No problems found'));
+  ht.appendChild(el('div', 'sub', nCrit + ' critical · ' + nWarn + ' warning' + (nWarn === 1 ? '' : 's') + ' across ' + areas.length + ' areas' + (nGap ? ' · ' + nGap + ' check' + (nGap === 1 ? '' : 's') + ' could not be made' : '')));
   hero.appendChild(ht); app.appendChild(hero);
 
   var tiles = el('div', 'tiles');

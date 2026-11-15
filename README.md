@@ -49,12 +49,17 @@ Options for `Get-PCHealth.ps1`:
 - **PSU and motherboard verdicts are inferred.** Most PSUs have no data link to
   the PC, and a passive check cannot prove stability under load. A clean report
   means "no evidence of a fault", not "proven good".
-- **Sensors use LibreHardwareMonitor**, downloaded from its GitHub releases on
-  first run into `lib\`. It loads a kernel driver while the scan runs and
-  unloads it afterwards. Some anti-cheat systems object to that driver, so do
-  not run the scan with a protected game open. Recent releases may also need
-  the separate PawnIO driver for CPU and motherboard sensors; the dashboard
-  says so if those readings are missing.
+- **Sensors use LibreHardwareMonitor**, fetched from nuget.org on first run
+  into `lib\`. The exact packages and the SHA-256 of every DLL are pinned in
+  `sensor-packages.json`, and every file is re-verified on every run before
+  anything is loaded, because the library runs with administrator rights. A
+  file that does not match is refused. It loads a kernel driver while the scan
+  runs and unloads it afterwards; some anti-cheat systems object to that, so do
+  not run the scan with a protected game open.
+- **"Partly checked" is not "Healthy".** If something could not be read (no
+  voltage rails, a failed event-log query, discarded sensor values) the area
+  is shown as "Partly checked" with a "Not checked" entry saying what is
+  missing, rather than a green tick.
 - **Installed-versus-latest is checked live for AMD graphics, AMD chipset and
   NVIDIA graphics**, by reading the vendor's own download page for the exact
   product. Vendors publish no official API, so if a site changes the lookup is
@@ -72,5 +77,20 @@ Options for `Get-PCHealth.ps1`:
 ## Files
 
 - `Get-PCHealth.ps1` - the collector (pure ASCII, runs on Windows PowerShell 5.1 and PowerShell 7)
+- `PCHealth.Rules.ps1` - every limit, threshold and decoding rule, as pure functions with no system access
+- `sensor-packages.json` - the pinned sensor library packages and file hashes
 - `dashboard.template.html` - the dashboard; the collector embeds the report data into a copy of it
-- `Run-PCHealth.cmd`, `Run-PCHealth-DeepScan.cmd` - launchers that bypass the script execution policy for this one run
+- `Run-PCHealth*.cmd` - launchers that bypass the script execution policy for this one run
+- `tests\Run-Tests.ps1` - tests for the rules; `tests\Smoke-Test.ps1` - runs the whole collector against a simulated PC
+
+## Tests
+
+```
+powershell -ExecutionPolicy Bypass -File tests\Run-Tests.ps1
+pwsh -File tests/Smoke-Test.ps1
+```
+
+The rules tests run anywhere. The smoke test needs PowerShell 7 and replaces the
+Windows-only queries with a simulated machine, so it proves the collector runs
+end to end and judges the simulated data correctly; it does not prove the real
+Windows queries return what is expected.
