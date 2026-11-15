@@ -318,63 +318,71 @@ function Get-DriveTempLimits([string]$hwName) {
     if ($oc) { $c = $oc.Value } elseif ($ow) { $c = $ow.Value + 5 }
     return @($w, $c)
 }
-# Returns @(severity, assessment text, finding detail or '' when another section already raises the finding)
-function Get-SensorVerdict($s) {
-    if (-not $s.Valid) { return @('info', 'Invalid reading, ignored', '') }
-    $n = $s.Name; $hi = $s.Max; $lo = $s.Min
-    function Limit([double]$v, [double]$warn, [double]$crit, [string]$what, [string]$detail) {
-        if ($v -ge $crit) { return @('crit', ('{0:N0} exceeds {1} limit {2}' -f $v, $what, $crit), $detail) }
-        if ($v -ge $warn) { return @('warn', ('{0:N0} is above the {1} comfort level {2}' -f $v, $what, $warn), $detail) }
-        return @('ok', 'Within range', '')
-    }
+$script:CpuTjMax = 95
+# The range a sensor is EXPECTED to sit in for this kind of component.
+# Returns @(low, high, criticalLow, criticalHigh, explanation used when outside, raiseFinding) or nothing when
+# the sensor has no meaningful range (clock speeds, loads) or cannot be identified.
+function Get-SensorSpec($s) {
+    $n = $s.Name; $none = -1e9
     if ($s.Type -eq 'Temperature') {
-        # thresholds, limits and offsets published by the device are reference values, not measurements
-        if ($n -match $script:RefSensor) { return @('', 'Reference value, not a reading', '') }
-        if ($s.HwType -eq 'Cpu') { return (Limit $hi 85 95 'CPU' '') }
+        if ($n -match $script:RefSensor) { return }
+        if ($s.HwType -eq 'Cpu') { return @(10, ($script:CpuTjMax - 5), $none, ($script:CpuTjMax + 3), '', $false) }
         if ($s.HwType -match '^Gpu') {
-            if ($n -match 'Hot ?Spot') { return (Limit $hi 100 110 'GPU hot spot' 'The hot spot is the hottest point on the GPU die. A gap of more than about 25 C above the core temperature suggests dried thermal paste or poor cooler contact.') }
-            return (Limit $hi 88 100 'GPU' '')
+            if ($n -match 'Hot ?Spot') { return @(10, 100, $none, 110, 'The hot spot is the hottest point on the GPU die. A gap of more than about 25 C above the core temperature suggests dried thermal paste or poor cooler contact.', $true) }
+            return @(10, 88, $none, 100, '', $false)
         }
-        if ($s.HwType -eq 'Storage') {
-            # judge against the limits the drive itself publishes, when it does
-            $lim = Get-DriveTempLimits $s.Hw
-            return (Limit $hi ($lim[0] - 5) $lim[1] 'drive' '')
-        }
-        if ($s.HwType -eq 'Memory') { return (Limit $hi 55 65 'memory' 'Hot memory produces errors, particularly with XMP / EXPO enabled.') }
-        if ($n -match 'VRM|MOS') { return (Limit $hi 100 115 'VRM' 'The VRM feeds the CPU. Overheating VRMs throttle the CPU and cause shutdowns under load; improve airflow over the area around the CPU socket.') }
-        if ($n -match 'Chipset|PCH') { return (Limit $hi 80 95 'chipset' 'X570 boards have a chipset fan; check it spins and is not clogged.') }
-        if ($n -match '^(CPU|System|Motherboard|T_Sensor)') { return (Limit $hi 80 95 'board' 'Board-level temperatures this high point at case airflow.') }
-        return @('', 'Not judged (unlabelled)', '')
+        if ($s.HwType -eq 'Storage') { $lim = Get-DriveTempLimits $s.Hw; return @(0, ($lim[0] - 5), $none, $lim[1], '', $false) }
+        if ($s.HwType -eq 'Memory') { return @(10, 55, $none, 65, 'Hot memory produces errors, particularly with XMP / EXPO enabled.', $true) }
+        if ($n -match 'VRM|MOS') { return @(10, 100, $none, 115, 'The VRM feeds the CPU. Overheating VRMs throttle the CPU and cause shutdowns under load; improve airflow around the CPU socket.', $true) }
+        if ($n -match 'Chipset|PCH') { return @(10, 80, $none, 95, 'X570 boards have a chipset fan; check it spins and is not clogged.', $true) }
+        if ($n -match '^(CPU|System|Motherboard|T_Sensor|Water)') { return @(10, 80, $none, 95, 'Board-level temperatures this high point at case airflow.', $true) }
+        return
     }
     if ($s.Type -eq 'Voltage') {
         $nom = Get-RailNominal $n
         if ($nom -gt 0 -and $s.HwType -ne 'Cpu') {
-            $d1 = 100 * ($lo - $nom) / $nom; $d2 = 100 * ($hi - $nom) / $nom
-            $d = $d1; if ([math]::Abs($d2) -gt [math]::Abs($d1)) { $d = $d2 }
-            if ([math]::Abs($d) -gt 15) { return @('', 'Not judged (not a scaled rail reading)', '') }
-            if ([math]::Abs($d) -gt 8) { return @('crit', ('{0:+0.0;-0.0} % from {1} V (ATX allows 5 %)' -f $d, $nom), '') }
-            if ([math]::Abs($d) -gt 5) { return @('warn', ('{0:+0.0;-0.0} % from {1} V (ATX allows 5 %)' -f $d, $nom), '') }
-            return @('ok', ('Within ATX tolerance ({0:+0.0;-0.0} %)' -f $d), '')
+            if ([math]::Abs(100 * ($s.Value - $nom) / $nom) -gt 15) { return }
+            return @(($nom * 0.95), ($nom * 1.05), ($nom * 0.92), ($nom * 1.08), '', $false)
         }
-        if ($n -match 'VBAT|CMOS') { if ($lo -gt 0.5 -and $lo -lt 2.7) { return @('warn', 'CMOS battery low', '') } else { return @('ok', 'Within range', '') } }
-        if ($n -match 'SoC') {
-            if ($hi -gt 1.3) { return @('warn', ('{0:N2} V is high for SoC voltage' -f $hi), 'On Ryzen, SoC voltage above about 1.2-1.3 V risks long-term degradation and is a known cause of memory instability. It is normally set by the XMP / EXPO profile or by hand in the BIOS.') }
-            return @('ok', 'Within range', '')
-        }
-        if ($n -match 'DRAM|DIMM') {
-            if ($hi -gt 1.5) { return @('warn', ('{0:N2} V is high for memory' -f $hi), 'DDR4 XMP profiles run at 1.35-1.5 V and DDR5 at 1.25-1.45 V. More than that needs active cooling and shortens module life.') }
-            return @('ok', 'Within range', '')
-        }
-        if ($n -match 'SVI2|Vcore|CPU Core$|^Core$') {
-            if ($hi -gt 1.55) { return @('warn', ('{0:N2} V exceeds the 1.55 V CPU ceiling' -f $hi), 'AMD specifies 1.55 V as the absolute maximum core voltage. Brief peaks near 1.5 V at light load are normal for Ryzen; sustained readings above the ceiling are not and usually come from a manual voltage or aggressive PBO setting.') }
-            return @('ok', 'Within range', '')
-        }
-        return @('', 'Not judged', '')
+        if ($n -match 'VBAT|CMOS') { return @(2.7, 3.4, $none, 1e9, '', $false) }
+        if ($n -match 'SoC') { return @(0.85, 1.25, $none, 1.35, 'On Ryzen, SoC voltage above about 1.25 V risks long-term degradation and is a known cause of memory instability. It is normally set by the XMP / EXPO profile or by hand in the BIOS.', $true) }
+        if ($n -match 'DRAM|DIMM') { return @(1.05, 1.5, $none, 1.6, 'DDR4 XMP profiles run at 1.35-1.5 V and DDR5 at 1.25-1.45 V. More than that needs active cooling and shortens module life.', $true) }
+        if ($n -match 'SVI2|Vcore|CPU Core$|^Core$') { return @(0.2, 1.5, $none, 1.55, 'AMD specifies 1.55 V as the absolute maximum core voltage. Brief peaks near 1.5 V at light load are normal for Ryzen; sustained readings above that usually come from a manual voltage or aggressive PBO setting.', $true) }
+        return
     }
-    if ($s.Type -eq 'Fan' -and $n -match 'CPU' -and $n -notmatch 'OPT|Pump' -and $hi -le 0) {
-        return @('warn', 'CPU fan header reads 0 RPM', 'Nothing is spinning on the CPU fan header. Expected if an AIO pump or fan hub is connected elsewhere; otherwise the CPU cooler fan has stopped.')
+    if ($s.Type -eq 'Fan' -and $n -match 'CPU' -and $n -notmatch 'OPT|Pump') {
+        return @(1, 1e9, $none, 1e9, 'Nothing is spinning on the CPU fan header. Expected if an AIO pump or fan hub is connected elsewhere; otherwise the CPU cooler fan has stopped.', $true)
     }
-    return @('', '', '')
+    return
+}
+function Get-SensorUnit([string]$type) {
+    switch ($type) {
+        'Temperature' { return ' C' } 'Voltage' { return ' V' } 'Fan' { return ' RPM' } 'Clock' { return ' MHz' } 'Power' { return ' W' }
+        'Load' { return ' %' } 'Level' { return ' %' } 'Control' { return ' %' } 'Data' { return ' GB' } 'SmallData' { return ' MB' }
+        'Current' { return ' A' } 'Throughput' { return ' B/s' } 'Frequency' { return ' Hz' }
+    }
+    return ''
+}
+# Returns @(severity, assessment text, finding detail or '', expected-range text)
+function Get-SensorVerdict($s) {
+    if (-not $s.Valid) { return @('info', 'Invalid reading, ignored', '', '') }
+    $sp = @(Get-SensorSpec $s)
+    if ($sp.Count -eq 0) {
+        $why = ''
+        if ($s.Type -eq 'Temperature' -and $s.Name -match $script:RefSensor) { $why = 'Reference value, not a reading' }
+        elseif ($s.Type -eq 'Temperature' -and $s.Name -match '^Temperature( #\d+)?$') { $why = 'Not judged: unlabelled input on the sensor chip' }
+        elseif ($s.Type -eq 'Voltage' -and (Get-RailNominal $s.Name) -gt 0 -and $s.HwType -ne 'Cpu') { $why = 'Not judged: not a correctly scaled rail reading' }
+        elseif ($s.Type -in 'Temperature', 'Voltage') { $why = 'Not judged: no known range for this sensor' }
+        return @('', $why, '', '')
+    }
+    $u = Get-SensorUnit $s.Type
+    if ($sp[1] -ge 1e9) { $range = ('above {0:0.##}{1}' -f ($sp[0] - 1), $u) } else { $range = ('{0:0.##} to {1:0.##}{2}' -f $sp[0], $sp[1], $u) }
+    $detail = ''; if ($sp[5]) { $detail = $sp[4] }
+    if ($s.Max -ge $sp[3]) { return @('crit', ('{0:0.##}{1} is beyond the safe limit of {2:0.##}{1}' -f $s.Max, $u, $sp[3]), $detail, $range) }
+    if ($s.Min -le $sp[2]) { return @('crit', ('{0:0.##}{1} is below the safe limit of {2:0.##}{1}' -f $s.Min, $u, $sp[2]), $detail, $range) }
+    if ($s.Max -gt $sp[1]) { return @('warn', ('{0:0.##}{1} is above the expected range' -f $s.Max, $u), $detail, $range) }
+    if ($s.Min -lt $sp[0]) { return @('warn', ('{0:0.##}{1} is below the expected range' -f $s.Min, $u), $detail, $range) }
+    return @('ok', 'Within expected range', '', $range)
 }
 
 # ---------------------------------------------------------------------- CPU
@@ -409,15 +417,21 @@ Invoke-Step 'CPU' {
         }
     }
 
+    if ($cpu) {
+        if ($cpu.Name -match 'X3D') { $script:CpuTjMax = 89 }
+        elseif ($cpu.Name -match 'Ryzen \d+ 5\d{3}') { $script:CpuTjMax = 90 }
+        elseif ($cpu.Name -match 'Intel') { $script:CpuTjMax = 100 }
+        Add-Fact 'cpu' 'Thermal limit assumed (TjMax)' ('{0} C' -f $script:CpuTjMax)
+    }
     $temps = Get-Sens '^Cpu$' 'Temperature'
     if ($temps.Count -gt 0) {
         $pkg = $temps | Where-Object { $_.Name -match 'Package|Tctl|Tdie|Core Max|CPU$' } | Sort-Object Max -Descending | Select-Object -First 1
         if (-not $pkg) { $pkg = $temps | Sort-Object Max -Descending | Select-Object -First 1 }
-        $sev = Get-TempSev $pkg.Max 85 95
+        $sev = Get-TempSev $pkg.Max ($script:CpuTjMax - 5) ($script:CpuTjMax + 3)
         Add-Gauge 'cpu' ('Temperature ({0})' -f $pkg.Name) $pkg.Max 'C' 110 $sev $(if ($script:Watched) { 'Peak over the {0}-minute watch (lowest {1:N0} C)' -f $WatchMinutes, $pkg.Min } else { 'Snapshot at current load, not a stress test' })
         if ($sev -ne 'ok') {
             Add-Finding 'cpu' $sev ('CPU reached {0:N0} C' -f $pkg.Max) `
-                ('Load during the scan was about {0} %. A temperature this high near idle points at cooling, not the silicon.' -f $cpu.LoadPercentage) `
+                ('That is within 5 C of this processor''s {0} C thermal limit, where it throttles itself. Load during the scan was about {1} %; a temperature this high near idle points at cooling, not the silicon.' -f $script:CpuTjMax, $cpu.LoadPercentage) `
                 'Check the cooler is seated, the pump or fan is spinning, and the thermal paste is not dried out.' ''
         }
     }
@@ -792,24 +806,37 @@ Invoke-Step 'Motherboard' {
     }
     if ($script:Whea.Count -eq 0) { Add-Finding 'board' 'ok' 'No hardware error (WHEA) events logged' ('Nothing in the last {0} days.' -f $Days) '' '' }
 
-    foreach ($t in (Get-Sens 'SuperIO|Motherboard|EmbeddedController' 'Temperature' | Where-Object { $_.Value -gt 5 -and $_.Value -lt 120 } | Sort-Object Value -Descending | Select-Object -First 3)) {
-        Add-Gauge 'board' ('{0}' -f $t.Name) $t.Value 'C' 110 (Get-TempSev $t.Value 80 95) $t.Hw
+    $boardT = Get-Sens 'SuperIO|Motherboard|EmbeddedController' 'Temperature'
+    foreach ($t in ($boardT | Where-Object { @(Get-SensorSpec $_).Count -gt 0 } | Sort-Object Max -Descending | Select-Object -First 4)) {
+        $vd = Get-SensorVerdict $t
+        Add-Gauge 'board' ('{0} temperature' -f $t.Name) $t.Max 'C' 110 $(if ($vd[0] -in 'warn', 'crit') { $vd[0] } else { 'ok' }) ('Expected {0}. Read from {1}' -f $vd[3], $t.Hw)
+    }
+    $mystery = @($boardT | Where-Object { @(Get-SensorSpec $_).Count -eq 0 -and $_.Max -ge 80 })
+    if ($mystery.Count -gt 0) {
+        Add-Finding 'board' 'info' ('{0} unidentified sensor input(s) read above 80 C and were not judged' -f $mystery.Count) `
+            ('{0}. These are numbered inputs on the board''s sensor chip ({1}) that the sensor library cannot name, because board makers do not publish which input is wired to what. The chip has more inputs than most boards use, and an unconnected input floats at a meaningless, often high and steady, value. That is the likely explanation here, but it cannot be proven from software.' -f (($mystery | ForEach-Object { '{0} = {1:N0} C' -f $_.Name, $_.Max }) -join ', '), $mystery[0].Hw) `
+            'Open the BIOS hardware monitor (or the board maker''s utility) and see whether any real temperature there matches these numbers. If none does, they are unconnected inputs and can be ignored.' ''
     }
     $srows = New-Rows
     $flagged = New-Rows
     foreach ($s in ($script:Sensors | Sort-Object HwType, Hw, Type, Name)) {
         $vd = Get-SensorVerdict $s
+        $u = Get-SensorUnit $s.Type
         $cellV = New-Cell $vd[1] $vd[0] ''
-        $row = @([string]$s.HwType, [string]$s.Hw, [string]$s.Type, [string]$s.Name, ('{0:N2}' -f $s.Value), ('{0:N2}' -f $s.Min), ('{0:N2}' -f $s.Max), $cellV)
+        $range = $vd[3]; if (-not $range) { $range = '-' }
+        $row = @([string]$s.HwType, [string]$s.Hw, [string]$s.Type, [string]$s.Name, ('{0:N2}{1}' -f $s.Value, $u))
+        if ($script:Watched) { $row += ('{0:N2} to {1:N2}{2}' -f $s.Min, $s.Max, $u) }
+        $row += $range; $row += $cellV
         [void]$srows.Add($row)
         if ($vd[0] -in 'warn', 'crit') {
-            [void]$flagged.Add(@([string]$s.Hw, [string]$s.Name, ('{0:N2}' -f $s.Min), ('{0:N2}' -f $s.Max), $cellV))
-            if ($vd[2]) { Add-Finding 'board' $vd[0] ('{0} / {1}: {2}' -f $s.Hw, $s.Name, $vd[1]) $vd[2] '' '' }
+            [void]$flagged.Add(@([string]$s.Hw, [string]$s.Name, ('{0:N2}{1}' -f $s.Value, $u), $range, $cellV))
+            if ($vd[2]) { Add-Finding 'board' $vd[0] ('{0} / {1}: {2} (expected {3})' -f $s.Hw, $s.Name, $vd[1], $range) $vd[2] '' '' }
         }
     }
-    Add-Table 'board' 'Sensors outside their expected range' @('Hardware', 'Sensor', 'Lowest', 'Highest', 'Assessment') $flagged 'Limits are general guidance for desktop parts; a board maker''s own limits take precedence.' $false
-    Add-Table 'board' 'All sensor readings' @('Kind', 'Hardware', 'Type', 'Sensor', 'Now', 'Lowest', 'Highest', 'Assessment') $srows `
-        ('Source: {0}. Only sensors with a recognised name and a known safe range get an assessment; unlabelled ones are listed but not judged.' -f $script:SensorSource) $true
+    $cols = @('Kind', 'Hardware', 'Type', 'Sensor', 'Now'); if ($script:Watched) { $cols += 'Seen during watch' }; $cols += 'Expected range'; $cols += 'Assessment'
+    Add-Table 'board' 'Sensors outside their expected range' @('Hardware', 'Sensor', 'Now', 'Expected range', 'Assessment') $flagged 'Expected ranges are general guidance for desktop parts; a board maker''s own limits take precedence.' $false
+    Add-Table 'board' 'All sensor readings' $cols $srows `
+        ('Source: {0}. "Expected range" is where that kind of component should sit; "Now" is compared against it. A dash means the sensor has no meaningful range (clock speeds, loads, counters) or could not be identified.' -f $script:SensorSource) $true
     if ($script:Sensors.Count -gt 0 -and -not $script:LowLevelBroken -and $flagged.Count -eq 0) {
         Add-Finding 'board' 'ok' 'No sensor reading is outside its expected range' $(if ($script:Watched) { 'Checked across the whole {0}-minute watch.' -f $WatchMinutes } else { 'Single snapshot at the current load.' }) '' ''
     }
