@@ -23,6 +23,12 @@
     Make no network calls (no Windows Update search, no vendor lookups, no
     LibreHardwareMonitor download; an already downloaded copy is still used).
 
+.PARAMETER WatchMinutes
+    Keep reading the sensors for this many minutes while you use the PC
+    normally (for example, play a game). Records the minimum and maximum of
+    every sensor so voltage sag and peak temperatures under YOUR real load
+    are captured, without this tool generating any load itself.
+
 .PARAMETER Days
     How far back to look in the event logs. Default 30.
 
@@ -42,6 +48,7 @@ param(
     [switch]$NoSensors,
     [switch]$Offline,
     [int]$Days = 30,
+    [int]$WatchMinutes = 0,
     [string]$OutDir,
     [switch]$NoOpen
 )
@@ -153,7 +160,7 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
     }
 }
 function Get-Sens([string]$hwTypePattern, [string]$type) {
-    return @($script:Sensors | Where-Object { $_.HwType -match $hwTypePattern -and $_.Type -eq $type })
+    return @($script:Sensors | Where-Object { $_.Valid -and $_.HwType -match $hwTypePattern -and $_.Type -eq $type })
 }
 function Get-TempSev([double]$v, [double]$warn, [double]$crit) {
     if ($v -ge $crit) { return 'crit' }
@@ -208,16 +215,36 @@ function Get-LhmLibrary {
     return (Get-ChildItem $dir -Filter 'LibreHardwareMonitorLib.dll' -Recurse | Select-Object -First 1)
 }
 
+$script:SensorMap = @{}
+$script:Watched = $false
+$script:LowLevelBroken = $false
 function Read-LhmHardware($hw) {
     $hw.Update()
     foreach ($s in $hw.Sensors) {
         if ($null -ne $s.Value) {
-            [void]$script:Sensors.Add([pscustomobject]@{
-                Hw = [string]$hw.Name; HwType = [string]$hw.HardwareType
-                Name = [string]$s.Name; Type = [string]$s.SensorType; Value = [double]$s.Value })
+            $key = '{0}|{1}|{2}|{3}' -f $hw.Identifier, $s.SensorType, $s.Name, $s.Index
+            $v = [double]$s.Value
+            $o = $script:SensorMap[$key]
+            if (-not $o) {
+                $o = [pscustomobject]@{
+                    Hw = [string]$hw.Name; HwType = [string]$hw.HardwareType
+                    Name = [string]$s.Name; Type = [string]$s.SensorType; Value = $v; Min = $v; Max = $v; Valid = $true }
+                $script:SensorMap[$key] = $o
+                [void]$script:Sensors.Add($o)
+            } else {
+                $o.Value = $v
+                if ($v -lt $o.Min) { $o.Min = $v }
+                if ($v -gt $o.Max) { $o.Max = $v }
+            }
         }
     }
     foreach ($sub in $hw.SubHardware) { Read-LhmHardware $sub }
+}
+function Get-RailNominal([string]$n) {
+    if ($n -match '12\s?V') { return 12 }
+    if ($n -match '(^|[^\d.])\+?5\s?V') { return 5 }
+    if ($n -match '3\.3\s?V|3VCC|3V3|AVCC|3VSB|AVSB') { return 3.3 }
+    return 0
 }
 
 if (-not $NoSensors) {
@@ -246,19 +273,91 @@ if (-not $NoSensors) {
             # Two reads a second apart: some sensors only report on the second poll.
             foreach ($hw in $computer.Hardware) { try { $hw.Update() } catch {} }
             Start-Sleep -Milliseconds 1200
-            foreach ($hw in $computer.Hardware) { try { Read-LhmHardware $hw } catch {} }
+            if ($WatchMinutes -gt 0) {
+                $script:Watched = $true
+                Write-Host ('      WATCH MODE: recording sensors for {0} minute(s). Use the PC as you normally would (play a game).' -f $WatchMinutes) -ForegroundColor Cyan
+            }
+            $until = (Get-Date).AddMinutes($WatchMinutes); $tick = 0
+            do {
+                foreach ($hw in $computer.Hardware) { try { Read-LhmHardware $hw } catch {} }
+                if ($WatchMinutes -gt 0) {
+                    Start-Sleep -Seconds 3; $tick++
+                    if ($tick % 20 -eq 0) { Write-Host ('      ... {0:N0} minute(s) left' -f ($until - (Get-Date)).TotalMinutes) }
+                }
+            } while ((Get-Date) -lt $until)
             $script:SensorSource = 'LibreHardwareMonitor ' + $dll.VersionInfo.FileVersion
         } finally {
             if ($computer) { try { $computer.Close() } catch {} }   # unloads the kernel driver
             [AppDomain]::CurrentDomain.remove_AssemblyResolve($resolver)
         }
         if ($script:Sensors.Count -eq 0) { $script:SensorNote = 'LibreHardwareMonitor loaded but returned no readings.' }
+        # Without low-level (MSR / port) access the library still lists CPU and board sensors but every value is a
+        # placeholder: 0 C temperatures, 0 W power and an identical 1.55 V on every core. Detect that and discard them.
+        $cpuT = @($script:Sensors | Where-Object { $_.HwType -eq 'Cpu' -and $_.Type -eq 'Temperature' })
+        if ($cpuT.Count -gt 0 -and @($cpuT | Where-Object { $_.Max -gt 0 }).Count -eq 0) {
+            $script:LowLevelBroken = $true
+            foreach ($s in $script:Sensors) { if ($s.HwType -match '^Cpu$|SuperIO|EmbeddedController|Motherboard') { $s.Valid = $false } }
+        }
+        foreach ($s in $script:Sensors) { if ($s.Type -eq 'Temperature' -and ($s.Max -le 0 -or $s.Max -gt 150)) { $s.Valid = $false } }
     }
     if (-not $script:SensorSource -and -not $script:SensorNote) {
         $script:SensorNote = 'LibreHardwareMonitor could not be loaded (see collection notes).'
     }
 } else {
     $script:SensorNote = 'Sensors disabled with -NoSensors.'
+}
+
+# Returns @(severity, assessment text, finding detail or '' when another section already raises the finding)
+function Get-SensorVerdict($s) {
+    if (-not $s.Valid) { return @('info', 'Invalid reading, ignored', '') }
+    $n = $s.Name; $hi = $s.Max; $lo = $s.Min
+    function Limit([double]$v, [double]$warn, [double]$crit, [string]$what, [string]$detail) {
+        if ($v -ge $crit) { return @('crit', ('{0:N0} exceeds {1} limit {2}' -f $v, $what, $crit), $detail) }
+        if ($v -ge $warn) { return @('warn', ('{0:N0} is above the {1} comfort level {2}' -f $v, $what, $warn), $detail) }
+        return @('ok', 'Within range', '')
+    }
+    if ($s.Type -eq 'Temperature') {
+        if ($s.HwType -eq 'Cpu') { return (Limit $hi 85 95 'CPU' '') }
+        if ($s.HwType -match '^Gpu') {
+            if ($n -match 'Hot ?Spot') { return (Limit $hi 100 110 'GPU hot spot' 'The hot spot is the hottest point on the GPU die. A gap of more than about 25 C above the core temperature suggests dried thermal paste or poor cooler contact.') }
+            return (Limit $hi 88 100 'GPU' '')
+        }
+        if ($s.HwType -eq 'Storage') { return (Limit $hi 70 80 'drive' '') }
+        if ($s.HwType -eq 'Memory') { return (Limit $hi 55 65 'memory' 'Hot memory produces errors, particularly with XMP / EXPO enabled.') }
+        if ($n -match 'VRM|MOS') { return (Limit $hi 100 115 'VRM' 'The VRM feeds the CPU. Overheating VRMs throttle the CPU and cause shutdowns under load; improve airflow over the area around the CPU socket.') }
+        if ($n -match 'Chipset|PCH') { return (Limit $hi 80 95 'chipset' 'X570 boards have a chipset fan; check it spins and is not clogged.') }
+        if ($n -match '^(CPU|System|Motherboard|T_Sensor)') { return (Limit $hi 80 95 'board' 'Board-level temperatures this high point at case airflow.') }
+        return @('', 'Not judged (unlabelled)', '')
+    }
+    if ($s.Type -eq 'Voltage') {
+        $nom = Get-RailNominal $n
+        if ($nom -gt 0 -and $s.HwType -ne 'Cpu') {
+            $d1 = 100 * ($lo - $nom) / $nom; $d2 = 100 * ($hi - $nom) / $nom
+            $d = $d1; if ([math]::Abs($d2) -gt [math]::Abs($d1)) { $d = $d2 }
+            if ([math]::Abs($d) -gt 15) { return @('', 'Not judged (not a scaled rail reading)', '') }
+            if ([math]::Abs($d) -gt 8) { return @('crit', ('{0:+0.0;-0.0} % from {1} V (ATX allows 5 %)' -f $d, $nom), '') }
+            if ([math]::Abs($d) -gt 5) { return @('warn', ('{0:+0.0;-0.0} % from {1} V (ATX allows 5 %)' -f $d, $nom), '') }
+            return @('ok', ('Within ATX tolerance ({0:+0.0;-0.0} %)' -f $d), '')
+        }
+        if ($n -match 'VBAT|CMOS') { if ($lo -gt 0.5 -and $lo -lt 2.7) { return @('warn', 'CMOS battery low', '') } else { return @('ok', 'Within range', '') } }
+        if ($n -match 'SoC') {
+            if ($hi -gt 1.3) { return @('warn', ('{0:N2} V is high for SoC voltage' -f $hi), 'On Ryzen, SoC voltage above about 1.2-1.3 V risks long-term degradation and is a known cause of memory instability. It is normally set by the XMP / EXPO profile or by hand in the BIOS.') }
+            return @('ok', 'Within range', '')
+        }
+        if ($n -match 'DRAM|DIMM') {
+            if ($hi -gt 1.5) { return @('warn', ('{0:N2} V is high for memory' -f $hi), 'DDR4 XMP profiles run at 1.35-1.5 V and DDR5 at 1.25-1.45 V. More than that needs active cooling and shortens module life.') }
+            return @('ok', 'Within range', '')
+        }
+        if ($n -match 'SVI2|Vcore|CPU Core$|^Core$') {
+            if ($hi -gt 1.55) { return @('warn', ('{0:N2} V exceeds the 1.55 V CPU ceiling' -f $hi), 'AMD specifies 1.55 V as the absolute maximum core voltage. Brief peaks near 1.5 V at light load are normal for Ryzen; sustained readings above the ceiling are not and usually come from a manual voltage or aggressive PBO setting.') }
+            return @('ok', 'Within range', '')
+        }
+        return @('', 'Not judged', '')
+    }
+    if ($s.Type -eq 'Fan' -and $n -match 'CPU' -and $n -notmatch 'OPT|Pump' -and $hi -le 0) {
+        return @('warn', 'CPU fan header reads 0 RPM', 'Nothing is spinning on the CPU fan header. Expected if an AIO pump or fan hub is connected elsewhere; otherwise the CPU cooler fan has stopped.')
+    }
+    return @('', '', '')
 }
 
 # ---------------------------------------------------------------------- CPU
@@ -295,12 +394,12 @@ Invoke-Step 'CPU' {
 
     $temps = Get-Sens '^Cpu$' 'Temperature'
     if ($temps.Count -gt 0) {
-        $pkg = $temps | Where-Object { $_.Name -match 'Package|Tctl|Tdie|Core Max|CPU$' } | Sort-Object Value -Descending | Select-Object -First 1
-        if (-not $pkg) { $pkg = $temps | Sort-Object Value -Descending | Select-Object -First 1 }
-        $sev = Get-TempSev $pkg.Value 85 95
-        Add-Gauge 'cpu' ('Temperature ({0})' -f $pkg.Name) $pkg.Value 'C' 110 $sev 'Snapshot at current load, not a stress test'
+        $pkg = $temps | Where-Object { $_.Name -match 'Package|Tctl|Tdie|Core Max|CPU$' } | Sort-Object Max -Descending | Select-Object -First 1
+        if (-not $pkg) { $pkg = $temps | Sort-Object Max -Descending | Select-Object -First 1 }
+        $sev = Get-TempSev $pkg.Max 85 95
+        Add-Gauge 'cpu' ('Temperature ({0})' -f $pkg.Name) $pkg.Max 'C' 110 $sev $(if ($script:Watched) { 'Peak over the {0}-minute watch (lowest {1:N0} C)' -f $WatchMinutes, $pkg.Min } else { 'Snapshot at current load, not a stress test' })
         if ($sev -ne 'ok') {
-            Add-Finding 'cpu' $sev ('CPU is at {0:N0} C without a stress load' -f $pkg.Value) `
+            Add-Finding 'cpu' $sev ('CPU reached {0:N0} C' -f $pkg.Max) `
                 ('Load during the scan was about {0} %. A temperature this high near idle points at cooling, not the silicon.' -f $cpu.LoadPercentage) `
                 'Check the cooler is seated, the pump or fan is spinning, and the thermal paste is not dried out.' ''
         }
@@ -352,11 +451,12 @@ Invoke-Step 'GPU' {
 
     $gt = Get-Sens '^Gpu' 'Temperature'
     foreach ($hwName in @($gt | Select-Object -ExpandProperty Hw -Unique)) {
-        $t = $gt | Where-Object { $_.Hw -eq $hwName } | Sort-Object Value -Descending | Select-Object -First 1
-        $sev = Get-TempSev $t.Value 88 100
-        Add-Gauge 'gpu' ('{0} - {1}' -f $hwName, $t.Name) $t.Value 'C' 110 $sev 'Snapshot at current load'
+        $t = $gt | Where-Object { $_.Hw -eq $hwName -and $_.Name -notmatch 'Hot ?Spot' } | Sort-Object Max -Descending | Select-Object -First 1
+        if (-not $t) { continue }
+        $sev = Get-TempSev $t.Max 88 100
+        Add-Gauge 'gpu' ('{0} - {1}' -f $hwName, $t.Name) $t.Max 'C' 110 $sev $(if ($script:Watched) { 'Peak over the {0}-minute watch' -f $WatchMinutes } else { 'Snapshot at current load' })
         if ($sev -ne 'ok') {
-            Add-Finding 'gpu' $sev ('{0} is at {1:N0} C' -f $hwName, $t.Value) 'That is high for a system that is not under a deliberate load.' `
+            Add-Finding 'gpu' $sev ('{0} reached {1:N0} C' -f $hwName, $t.Max) 'That is high for a system that is not under a deliberate load.' `
                 'Check the fans spin, clear dust from the heatsink, and check case airflow.' ''
         }
     }
@@ -446,19 +546,28 @@ Invoke-Step 'Drives' {
                 ('Operational status: {0}. The drive itself is signalling a problem.' -f ($d.OperationalStatus -join ', ')) `
                 'Back up anything on this drive now, then plan its replacement.' ''
         }
-        $wear = ''; $temp = ''; $hours = ''; $errs = ''
-        if ($r) {
-            if ($null -ne $r.Wear) {
-                $wear = ('{0} %' -f $r.Wear)
-                $ws = 'ok'; if ($r.Wear -ge 90) { $ws = 'crit' } elseif ($r.Wear -ge 70) { $ws = 'warn' }
-                if ($d.MediaType -ne 'HDD') {
-                    Add-Gauge 'drives' ('{0} - rated life used' -f $name) $r.Wear '%' 100 $ws 'Percentage of rated write endurance consumed'
-                    if ($ws -ne 'ok') {
-                        Add-Finding 'drives' $ws ('{0} has used {1} % of its rated write endurance' -f $name, $r.Wear) `
-                            'SSDs often outlive this figure, but past 100 % the manufacturer no longer guarantees data retention.' 'Plan a replacement and keep backups current.' ''
-                    }
-                }
+        $wear = ''; $temp = ''; $hours = ''; $errs = ''; $written = ''
+        # the drive's own SMART attributes as read by LibreHardwareMonitor, matched on model name
+        $ls = @($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Valid -and ($_.Hw -eq $name -or $_.Hw -like "*$name*" -or $name -like ('*' + $_.Hw + '*')) })
+        $wr = $ls | Where-Object { $_.Name -match 'Data Written|Total Bytes Written|Host Writes' } | Select-Object -First 1
+        if ($wr) { if ($wr.Value -ge 1000) { $written = ('{0:N1} TB' -f ($wr.Value / 1000)) } else { $written = ('{0:N0} GB' -f $wr.Value) } }
+        $pct = $null
+        $pu = $ls | Where-Object { $_.Name -match 'Percentage Used' } | Select-Object -First 1
+        $rl = $ls | Where-Object { $_.Name -match 'Remaining Life' } | Select-Object -First 1
+        if ($pu) { $pct = $pu.Value } elseif ($rl) { $pct = 100 - $rl.Value } elseif ($r -and $null -ne $r.Wear) { $pct = [double]$r.Wear }
+        if ($d.MediaType -eq 'HDD') { $wear = 'n/a (HDD)' }
+        elseif ($null -ne $pct) {
+            if ($pct -lt 1) { $wear = 'under 1 %' } else { $wear = ('{0:N0} %' -f $pct) }
+            $ws = 'ok'; if ($pct -ge 90) { $ws = 'crit' } elseif ($pct -ge 70) { $ws = 'warn' }
+            $gnote = 'Share of rated write endurance consumed, as reported by the drive'
+            if ($written) { $gnote = ('{0} written in its lifetime. {1}' -f $written, $gnote) }
+            Add-Gauge 'drives' ('{0} - rated life used' -f $name) $pct '%' 100 $ws $gnote
+            if ($ws -ne 'ok') {
+                Add-Finding 'drives' $ws ('{0} has used {1:N0} % of its rated write endurance' -f $name, $pct) `
+                    'SSDs often outlive this figure, but past 100 % the manufacturer no longer guarantees data retention.' 'Plan a replacement and keep backups current.' ''
             }
+        } else { $wear = 'not reported' }
+        if ($r) {
             if ($r.Temperature) {
                 $temp = ('{0} C' -f $r.Temperature)
                 $limit = 70; if ($d.MediaType -eq 'HDD') { $limit = 55 }
@@ -475,10 +584,15 @@ Invoke-Step 'Drives' {
             }
         }
         [void]$rows.Add(@($name, [string]$d.MediaType, [string]$d.BusType, (Format-Size $d.Size), (New-Cell $hs $hsSev ''),
-                $wear, $temp, $hours, $errs, [string]$d.FirmwareVersion))
+                $wear, $written, $temp, $hours, $errs, [string]$d.FirmwareVersion))
     }
-    Add-Table 'drives' 'Physical drives' @('Drive', 'Type', 'Bus', 'Size', 'Health', 'Life used', 'Temp', 'Power-on', 'Uncorrected errors', 'Firmware') $rows `
-        'Read from the drive''s own SMART / NVMe health log. No surface scan or write test is performed.' $false
+    Add-Table 'drives' 'Physical drives' @('Drive', 'Type', 'Bus', 'Size', 'Health', 'Life used', 'Data written', 'Temp', 'Power-on', 'Uncorrected errors', 'Firmware') $rows `
+        'Read from the drive''s own SMART / NVMe health log; no surface scan or write test is performed. SSDs report life used in whole percent of their rated endurance, so a drive reads "under 1 %" until about 1 % of its rated terabytes-written is consumed (roughly 6 TB on a 600 TBW drive). "Data written" is the figure to judge that against, and needs the sensor library. Life used does not apply to hard disks.' $false
+    $smart = New-Rows
+    foreach ($s in ($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Valid } | Sort-Object Hw, Type, Name)) {
+        [void]$smart.Add(@([string]$s.Hw, [string]$s.Name, [string]$s.Type, ('{0:N1}' -f $s.Value)))
+    }
+    Add-Table 'drives' 'SMART detail per drive' @('Drive', 'Attribute', 'Kind', 'Value') $smart 'Kinds: Level = percent, Data = gigabytes, Temperature = Celsius.' $true
     if ($disks.Count -eq 0) { Add-Finding 'drives' 'info' 'Could not enumerate physical drives' 'Get-PhysicalDisk returned nothing; run elevated.' '' '' }
 
     foreach ($p in (Get-Cim 'MSStorageDriver_FailurePredictStatus' 'root\wmi')) {
@@ -486,7 +600,7 @@ Invoke-Step 'Drives' {
             Add-Finding 'drives' 'crit' 'A drive is predicting its own failure (SMART)' ('Instance: {0}' -f $p.InstanceName) 'Back up immediately and replace the drive.' ''
         }
     }
-    foreach ($s in ($script:Sensors | Where-Object { $_.HwType -eq 'Storage' -and $_.Name -match 'Available Spare$|Remaining Life' })) {
+    foreach ($s in ($script:Sensors | Where-Object { $_.Valid -and $_.HwType -eq 'Storage' -and $_.Name -match 'Available Spare$|Remaining Life' })) {
         if ($s.Value -lt 20) {
             Add-Finding 'drives' 'warn' ('{0}: {1} is down to {2:N0} %' -f $s.Hw, $s.Name, $s.Value) '' 'Plan a replacement and keep backups current.' ''
         }
@@ -531,21 +645,29 @@ Invoke-Step 'Power supply' {
     $rows = New-Rows
     $judged = 0
     foreach ($v in $volts) {
-        $nominal = 0
-        if ($v.Name -match '12\s?V') { $nominal = 12 }
-        elseif ($v.Name -match '(^|[^\d.])\+?5\s?V') { $nominal = 5 }
-        elseif ($v.Name -match '3\.3\s?V|3VCC|3V3|AVCC|3VSB|AVSB') { $nominal = 3.3 }
+        $nominal = Get-RailNominal $v.Name
         $cell = New-Cell '-' '' ''
         if ($nominal -gt 0) {
-            $dev = 100 * ($v.Value - $nominal) / $nominal
+            $devLo = 100 * ($v.Min - $nominal) / $nominal; $devHi = 100 * ($v.Max - $nominal) / $nominal
+            $dev = $devLo; if ([math]::Abs($devHi) -gt [math]::Abs($devLo)) { $dev = $devHi }
             if ([math]::Abs($dev) -le 15) {
                 $judged++
                 $sev = 'ok'; if ([math]::Abs($dev) -gt 8) { $sev = 'crit' } elseif ([math]::Abs($dev) -gt 5) { $sev = 'warn' }
-                $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V' -f $dev, $nominal) $sev ''
+                $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V at worst' -f $dev, $nominal) $sev ''
                 if ($sev -ne 'ok') {
-                    Add-Finding 'psu' $sev ('{0} rail reads {1:N2} V ({2:+0.0;-0.0} %)' -f $v.Name, $v.Value, $dev) `
+                    Add-Finding 'psu' $sev ('{0} rail reached {1:+0.0;-0.0} % from nominal (range {2:N2} to {3:N2} V)' -f $v.Name, $dev, $v.Min, $v.Max) `
                         'The ATX specification allows +/-5 %. Motherboard sensor readings are approximate, so treat this as a prompt to verify, not proof.' `
                         'Confirm in the BIOS hardware monitor or with a multimeter before replacing anything.' ''
+                }
+                if ($script:Watched -and $nominal -eq 12) {
+                    $sag = 100 * ($v.Max - $v.Min) / $nominal
+                    if ($sag -gt 3) {
+                        Add-Finding 'psu' 'warn' ('12 V rail swung {0:N1} % during the watch ({1:N2} to {2:N2} V)' -f $sag, $v.Min, $v.Max) `
+                            'A healthy PSU holds the 12 V rail within roughly 2-3 % between idle and full load. A larger drop when the GPU loads up is the classic sign of a tired, undersized or poorly cabled PSU.' `
+                            'Check each GPU power connector has its own cable from the PSU (no daisy-chained pigtails), then consider the PSU itself.' ''
+                    } else {
+                        Add-Finding 'psu' 'ok' ('12 V rail held steady during the watch ({0:N2} to {1:N2} V, {2:N1} % swing)' -f $v.Min, $v.Max, $sag) ('Recorded over {0} minute(s) of your own use.' -f $WatchMinutes) '' ''
+                    }
                 }
             } else {
                 $cell = New-Cell 'not a scaled rail reading' '' ''
@@ -554,7 +676,18 @@ Invoke-Step 'Power supply' {
         if ($v.Name -match 'VBAT|CMOS|Battery' -and $v.Value -gt 0.5 -and $v.Value -lt 2.7) {
             Add-Finding 'board' 'warn' ('CMOS battery reads {0:N2} V' -f $v.Value) 'A CR2032 below about 2.7 V is near the end of its life; the symptom is the clock and BIOS settings resetting.' 'Replace the CR2032 coin cell.' ''
         }
-        [void]$rows.Add(@([string]$v.Hw, [string]$v.Name, ('{0:N3} V' -f $v.Value), $cell))
+        $reading = ('{0:N3} V' -f $v.Value); if ($script:Watched) { $reading = ('{0:N3} to {1:N3} V' -f $v.Min, $v.Max) }
+        [void]$rows.Add(@([string]$v.Hw, [string]$v.Name, $reading, $cell))
+    }
+    if ($script:Watched) {
+        $cp = Get-Sens '^Cpu$' 'Power' | Where-Object { $_.Name -match 'Package' } | Sort-Object Max -Descending | Select-Object -First 1
+        $gp = Get-Sens '^Gpu' 'Power' | Sort-Object Max -Descending | Select-Object -First 1
+        if ($cp) { Add-Fact 'psu' 'Peak CPU package power (watch)' ('{0:N0} W' -f $cp.Max) }
+        if ($gp) { Add-Fact 'psu' 'Peak GPU power (watch)' ('{0:N0} W' -f $gp.Max) }
+        if ($cp -and $gp) { Add-Fact 'psu' 'Peak CPU + GPU together' ('about {0:N0} W, plus roughly 60-100 W for the rest of the system' -f ($cp.Max + $gp.Max)) }
+    } else {
+        Add-Finding 'psu' 'info' 'Rails were only read at idle' 'A weak PSU usually looks fine at idle and sags when the GPU loads up.' `
+            'Run Run-PCHealth-Watch.cmd and play a demanding game for 20 minutes. The tool records the rails, temperatures and power draw during your own use and reports the lowest 12 V reading.' ''
     }
     Add-Table 'psu' 'Voltage readings' @('Source', 'Sensor', 'Reading', 'Against ATX nominal') $rows `
         'Sensor-chip labels are not standardised; only readings clearly labelled as a 12 V, 5 V or 3.3 V rail are judged.' $false
@@ -643,12 +776,30 @@ Invoke-Step 'Motherboard' {
         Add-Gauge 'board' ('{0}' -f $t.Name) $t.Value 'C' 110 (Get-TempSev $t.Value 80 95) $t.Hw
     }
     $srows = New-Rows
+    $flagged = New-Rows
     foreach ($s in ($script:Sensors | Sort-Object HwType, Hw, Type, Name)) {
-        [void]$srows.Add(@([string]$s.HwType, [string]$s.Hw, [string]$s.Type, [string]$s.Name, ('{0:N2}' -f $s.Value)))
+        $vd = Get-SensorVerdict $s
+        $cellV = New-Cell $vd[1] $vd[0] ''
+        $row = @([string]$s.HwType, [string]$s.Hw, [string]$s.Type, [string]$s.Name, ('{0:N2}' -f $s.Value), ('{0:N2}' -f $s.Min), ('{0:N2}' -f $s.Max), $cellV)
+        [void]$srows.Add($row)
+        if ($vd[0] -in 'warn', 'crit') {
+            [void]$flagged.Add(@([string]$s.Hw, [string]$s.Name, ('{0:N2}' -f $s.Min), ('{0:N2}' -f $s.Max), $cellV))
+            if ($vd[2]) { Add-Finding 'board' $vd[0] ('{0} / {1}: {2}' -f $s.Hw, $s.Name, $vd[1]) $vd[2] '' '' }
+        }
     }
-    Add-Table 'board' 'All sensor readings' @('Kind', 'Hardware', 'Type', 'Sensor', 'Value') $srows ('Source: {0}' -f $script:SensorSource) $true
+    Add-Table 'board' 'Sensors outside their expected range' @('Hardware', 'Sensor', 'Lowest', 'Highest', 'Assessment') $flagged 'Limits are general guidance for desktop parts; a board maker''s own limits take precedence.' $false
+    Add-Table 'board' 'All sensor readings' @('Kind', 'Hardware', 'Type', 'Sensor', 'Now', 'Lowest', 'Highest', 'Assessment') $srows `
+        ('Source: {0}. Only sensors with a recognised name and a known safe range get an assessment; unlabelled ones are listed but not judged.' -f $script:SensorSource) $true
+    if ($script:Sensors.Count -gt 0 -and -not $script:LowLevelBroken -and $flagged.Count -eq 0) {
+        Add-Finding 'board' 'ok' 'No sensor reading is outside its expected range' $(if ($script:Watched) { 'Checked across the whole {0}-minute watch.' -f $WatchMinutes } else { 'Single snapshot at the current load.' }) '' ''
+    }
 
-    if ($script:Sensors.Count -gt 0 -and (Get-Sens 'SuperIO' 'Voltage').Count -eq 0 -and (Get-Sens '^Cpu$' 'Temperature').Count -eq 0) {
+    if ($script:LowLevelBroken) {
+        $pawn = Get-Service -Name 'PawnIO' -ErrorAction SilentlyContinue
+        Add-Finding 'board' 'warn' 'CPU and motherboard sensor readings are invalid and were ignored' `
+            ('The sensor library listed the sensors but every value is a placeholder (0 C, 0 W, an identical 1.55 V on every core). That happens when it has no low-level access to the CPU and the board''s sensor chip, so temperatures, fan speeds and the 12 V / 5 V / 3.3 V rails could not be assessed. PawnIO driver installed: {0}.' -f $(if ($pawn) { 'yes' } else { 'no' })) `
+            'Install the PawnIO driver (pawnio.eu, or: winget install namazso.PawnIO), restart, and re-run. If it is already installed, Windows Security > Core isolation > Memory integrity or an anti-cheat service may be blocking it.' 'https://pawnio.eu/'
+    } elseif ($script:Sensors.Count -gt 0 -and (Get-Sens 'SuperIO' 'Voltage').Count -eq 0 -and (Get-Sens '^Cpu$' 'Temperature').Count -eq 0) {
         Add-Finding 'board' 'info' 'CPU and motherboard sensors were not readable' `
             'LibreHardwareMonitor returned data for some devices but not the CPU or the board sensor chip. Recent LibreHardwareMonitor releases need the separate PawnIO driver for low-level access, and some anti-cheat or core-isolation settings block it.' `
             'Install PawnIO from pawnio.eu and re-run if you want temperatures and voltage rails.' 'https://pawnio.eu/'
@@ -658,6 +809,9 @@ Invoke-Step 'Motherboard' {
 }
 
 # ------------------------------------------------------------------ Windows
+Invoke-Step 'Driver inventory' {
+    $script:AllDrv = @(Get-Cim 'Win32_PnPSignedDriver' | Where-Object { $_.DriverVersion -and $_.DeviceName })
+}
 Invoke-Step 'Windows installation' {
     $os = Get-Cim 'Win32_OperatingSystem' | Select-Object -First 1
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
@@ -743,11 +897,33 @@ Invoke-Step 'Windows installation' {
             $n = $searcher.GetTotalHistoryCount()
             if ($n -gt 0) {
                 $hist = @($searcher.QueryHistory(0, [math]::Min(300, $n)) | Where-Object { $_.Date -ge $Since })
-                $failed = @($hist | Where-Object { $_.ResultCode -eq 4 })
+                # Triage failures: ignore ones that later succeeded, and separate driver updates for hardware that is gone.
+                $failed = @(); $stale = @(); $fixed = 0
+                $vendors = 'NVIDIA', 'Advanced Micro Devices|AMD', 'Intel', 'Realtek', 'Qualcomm', 'MediaTek', 'Broadcom', 'Logitech', 'Corsair', 'Synaptics', 'Samsung'
+                foreach ($f in @($hist | Where-Object { $_.ResultCode -eq 4 })) {
+                    $title = [string]$f.Title
+                    if (@($hist | Where-Object { $_.Title -eq $title -and $_.ResultCode -eq 2 -and $_.Date -gt $f.Date }).Count -gt 0) { $fixed++; continue }
+                    $vend = $vendors | Where-Object { $title -match ('^({0})\b' -f $_) } | Select-Object -First 1
+                    if ($vend -and $title -notmatch 'KB\d{6,}') {
+                        if ($title -match ' - Display - |Display Driver') {
+                            $present = @($script:Gpus | Where-Object { $_.Name -match $vend -or ($vend -match 'AMD' -and $_.Name -match 'Radeon') }).Count -gt 0
+                        } else {
+                            $present = @($script:AllDrv | Where-Object { ('{0} {1} {2}' -f $_.Manufacturer, $_.DriverProviderName, $_.DeviceName) -match $vend }).Count -gt 0
+                        }
+                        if (-not $present) { $stale += $f; continue }
+                    }
+                    $failed += $f
+                }
                 if ($failed.Count -gt 0) {
                     Add-Finding 'windows' 'warn' ('{0} update installation failure(s) in the last {1} days' -f $failed.Count, $Days) `
                         ('Most recent: {0}' -f (Get-Short ([string]$failed[0].Title) 160)) 'If the same update keeps failing, run the deep scan and then the Windows Update troubleshooter.' ''
                 }
+                if ($stale.Count -gt 0) {
+                    Add-Finding 'windows' 'info' ('{0} failed driver update(s) were for hardware that is no longer installed' -f $stale.Count) `
+                        ('{0}. The failure itself does not matter because the device is gone. Windows Update tried it because driver packages or software for the old device are still on the system.' -f (($stale | ForEach-Object { Get-Short ([string]$_.Title) 80 } | Select-Object -Unique) -join '; ')) `
+                        'Nothing needs fixing in Windows. To stop it being offered again, remove the leftover software and driver packages; the Drivers section lists them.' ''
+                }
+                if ($fixed -gt 0) { Add-Fact 'windows' 'Update failures that later succeeded' $fixed }
                 $script:WuHistory = $hist
             }
         } catch { [void]$script:Errors.Add('Windows Update search: ' + $_.Exception.Message) }
@@ -952,10 +1128,9 @@ Invoke-Step 'Crash analysis' {
 $script:AmdIndex = $null
 $script:AmdNewest = ''
 function Get-MaxVer([string]$text, [string]$pattern) {
-    $best = $null
-    foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { $v = ConvertTo-Ver $m.Groups[1].Value; if ($v -and (-not $best -or $v -gt $best)) { $best = $v } }
-    if ($best) { return [string]$best }
-    return ''
+    $best = $null; $bestText = ''
+    foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { $v = ConvertTo-Ver $m.Groups[1].Value; if ($v -and (-not $best -or $v -gt $best)) { $best = $v; $bestText = $m.Groups[1].Value } }
+    return $bestText
 }
 function Get-AmdIndex {
     if ($null -eq $script:AmdIndex) {
@@ -998,7 +1173,7 @@ function ConvertTo-Ver([string]$s) { try { return [version]$s } catch { return $
 
 Invoke-Step 'Drivers' {
     $keyClasses = 'DISPLAY', 'NET', 'MEDIA', 'BLUETOOTH', 'SYSTEM', 'HDC', 'SCSIADAPTER', 'USB', 'MONITOR', 'HIDCLASS', 'MOUSE', 'KEYBOARD', 'CAMERA', 'AUDIOENDPOINT', 'SOFTWARECOMPONENT', 'EXTENSION', 'FIRMWARE', 'BIOMETRIC'
-    $all = @(Get-Cim 'Win32_PnPSignedDriver' | Where-Object { $_.DriverVersion -and $_.DeviceName })
+    $all = @($script:AllDrv)
     $third = @($all | Where-Object { $_.DriverProviderName -and $_.DriverProviderName -notmatch '^Microsoft' })
     $seen = @{}
     $rows = New-Rows
@@ -1081,6 +1256,25 @@ Invoke-Step 'Drivers' {
         Add-Table 'drivers' 'Driver packages staged in more than one version' @('Class', 'Provider', 'Package', 'Versions (newest first)') $drow `
             'Normal after updates: Windows keeps old versions for roll-back. It matters only if the active driver is not the newest one (flagged separately).' $true
 
+        $gpuNames = ($script:Gpus | ForEach-Object { $_.Name }) -join ' '
+        $left = @($staged | Where-Object { $_.ClassName -eq 'Display' } | Where-Object {
+                ($_.ProviderName -match 'NVIDIA' -and $gpuNames -notmatch 'NVIDIA') -or
+                ($_.ProviderName -match 'Advanced Micro|AMD|ATI' -and $gpuNames -notmatch 'AMD|Radeon') -or
+                ($_.ProviderName -match 'Intel' -and $gpuNames -notmatch 'Intel') })
+        if ($left.Count -gt 0) {
+            $orow = New-Rows
+            foreach ($o in $left) { [void]$orow.Add(@([string]$o.Driver, [string]$o.ProviderName, [IO.Path]::GetFileName($o.OriginalFileName), [string]$o.Version, (Format-Day $o.Date))) }
+            Add-Table 'drivers' 'Leftover graphics driver packages for hardware no longer installed' @('Package', 'Provider', 'Original file', 'Version', 'Date') $orow `
+                'Remove one with:  pnputil /delete-driver <Package> /uninstall   (from an administrator prompt).' $false
+            $apps = @()
+            foreach ($pair in @(@('NVIDIA', 'NVIDIA'), @('AMD Software|Radeon Software', 'AMD|Radeon'), @('Intel.*Graphics', 'Intel'))) {
+                if ($gpuNames -notmatch $pair[1]) { $pr = Get-InstalledProgram $pair[0]; if ($pr) { $apps += [string]$pr.DisplayName } }
+            }
+            Add-Finding 'drivers' 'warn' ('{0} graphics driver package(s) remain from a graphics card that is no longer installed' -f $left.Count) `
+                ('Providers: {0}.{1} Leftovers from a previous card are a recognised source of instability after a GPU swap, and they are why Windows Update keeps trying to install drivers for it.' -f (($left | ForEach-Object { $_.ProviderName } | Select-Object -Unique) -join ', '), $(if ($apps.Count -gt 0) { ' Software still installed: ' + ($apps -join ', ') + '.' } else { '' })) `
+                'Uninstall the old vendor''s software from Settings > Apps, then remove the packages listed in the table below (or run Display Driver Uninstaller in Safe Mode, choosing the OLD vendor).' ''
+        }
+
         foreach ($gpu in $script:Gpus) {
             $active = ConvertTo-Ver $gpu.DriverVersion
             if (-not $active) { continue }
@@ -1121,6 +1315,15 @@ Invoke-Step 'Drivers' {
         foreach ($h in $drvHist) {
             $rc = New-Cell 'Installed' '' ''; if ($h.ResultCode -eq 4) { $rc = New-Cell 'Failed' 'warn' '' }
             [void]$hrow.Add(@((Format-Stamp $h.Date), (Get-Short ([string]$h.Title) 120), $rc))
+        }
+        foreach ($gpu in $script:Gpus) {
+            $hit = $drvHist | Where-Object { $_.ResultCode -eq 2 -and $gpu.DriverVersion -and ([string]$_.Title).Contains([string]$gpu.DriverVersion) } | Select-Object -First 1
+            if ($hit) {
+                $conflicts++
+                Add-Finding 'drivers' 'warn' ('The graphics driver in use for {0} was installed by Windows Update, not by the vendor installer' -f $gpu.Name) `
+                    ('Windows Update installed driver {0} on {1}, and that is the version now active. If you installed the vendor package yourself, Windows Update has replaced its driver underneath the vendor software, which then reports a version that no longer matches the driver (AMD Software shows this as a "version mismatch" error).' -f $gpu.DriverVersion, (Format-Stamp $hit.Date)) `
+                    'Stop Windows Update delivering drivers (see the note below), then reinstall the vendor package so driver and software match.' ''
+            }
         }
         Add-Table 'drivers' ('Drivers Windows Update installed in the last {0} days' -f $Days) @('When', 'Driver', 'Result') $hrow `
             'If a GPU or chipset entry here is dated after you installed the vendor package yourself, Windows Update overwrote it.' $false
@@ -1323,6 +1526,7 @@ $report = [ordered]@{
         elevated = [bool]$IsAdmin
         days = $Days
         deepScan = [bool]$DeepScan
+        watchMinutes = $WatchMinutes
         offline = [bool]$Offline
         sensorSource = [string]$script:SensorSource
         sensorNote = [string]$script:SensorNote

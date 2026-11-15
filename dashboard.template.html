@@ -27,8 +27,9 @@ body { margin: 0; background: var(--page); color: var(--ink);
   font: 15px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
 .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
 h1 { font-size: 26px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-h2 { font-size: 19px; margin: 0; font-weight: 600; }
-h3 { font-size: 13px; margin: 22px 0 8px; font-weight: 600; color: var(--ink2); text-transform: uppercase; letter-spacing: .05em; }
+h2 { font-size: 23px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+h3 { font-size: 16px; margin: 30px 0 10px; padding: 7px 12px; font-weight: 650; color: var(--ink);
+  background: var(--sunk); border-left: 4px solid var(--note); border-radius: 0 6px 6px 0; }
 a { color: var(--link); }
 .sub { color: var(--ink2); margin-top: 4px; }
 .num { font-variant-numeric: tabular-nums; }
@@ -53,7 +54,7 @@ a { color: var(--link); }
 .tile .state { margin: 6px 0 2px; font-size: 16px; }
 .tile .sum { font-size: 13px; color: var(--ink2); }
 
-section { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; margin-top: 16px; scroll-margin-top: 12px; }
+section { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--line2); border-radius: 12px; padding: 20px 22px; margin-top: 16px; scroll-margin-top: 12px; }
 .shead { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 
 .gauges { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px 26px; margin-top: 16px; }
@@ -85,7 +86,9 @@ th { text-align: left; font-weight: 600; color: var(--ink2); border-bottom: 1px 
 td { border-bottom: 1px solid var(--line); padding: 7px 12px 7px 0; vertical-align: top; overflow-wrap: anywhere; }
 td .chip { font-weight: 500; white-space: normal; } td .dot { width: 15px; height: 15px; font-size: 10px; }
 .tnote { font-size: 12.5px; color: var(--ink3); margin: 6px 0 0; }
-details > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink2); text-transform: uppercase; letter-spacing: .05em; margin: 22px 0 8px; }
+details > summary { cursor: pointer; font-size: 16px; font-weight: 650; color: var(--ink); margin: 30px 0 10px; padding: 7px 12px;
+  background: var(--sunk); border-left: 4px solid var(--line2); border-radius: 0 6px 6px 0; }
+details[open] > summary { border-left-color: var(--note); }
 footer { color: var(--ink3); font-size: 13px; margin-top: 22px; }
 footer li { margin: 2px 0; }
 @media print { body { background: #fff; } section, .hero, .tile { break-inside: avoid; } details { display: block; } }
@@ -214,7 +217,7 @@ var REPORT = /*__REPORT_DATA__*/null;
   var foot = el('footer');
   var bits = ['Scan took ' + m.durationSec + ' s', m.elevated ? 'ran elevated' : 'NOT elevated (limited data)',
     m.sensorSource ? 'sensors: ' + m.sensorSource : 'sensors: none' + (m.sensorNote ? ' (' + m.sensorNote + ')' : ''),
-    m.deepScan ? 'deep scan on' : 'deep scan off', m.offline ? 'offline mode' : ''];
+    m.deepScan ? 'deep scan on' : 'deep scan off', m.watchMinutes ? 'watched sensors for ' + m.watchMinutes + ' min' : '', m.offline ? 'offline mode' : ''];
   foot.appendChild(el('div', '', bits.filter(Boolean).join(' · ')));
   if (m.errors && m.errors.length) {
     foot.appendChild(el('div', '', 'Collection notes (checks that could not run):'));

@@ -14,12 +14,18 @@ test, benchmark or surface scan, so it adds no wear to any component.
 `Run-PCHealth-DeepScan.cmd` additionally runs the read-only
 `DISM /ScanHealth` and `sfc /verifyonly` (10-20 minutes).
 
+`Run-PCHealth-Watch.cmd` keeps reading the sensors for 20 minutes while you
+use the PC (play a demanding game), then reports the lowest and highest value
+of every sensor: 12 V rail sag, peak temperatures, peak CPU and GPU power. The
+tool generates no load itself, so this adds no wear beyond your normal use.
+
 Options for `Get-PCHealth.ps1`:
 
 | Switch | Effect |
 |---|---|
 | `-DeepScan` | Add the DISM and SFC verification |
 | `-NoSensors` | Do not load LibreHardwareMonitor (no kernel driver, no temperatures or voltages) |
+| `-WatchMinutes 20` | Record sensor minimum and maximum over that many minutes of your own use |
 | `-Offline` | No network calls at all |
 | `-Days 90` | Event-log look-back window (default 30) |
 | `-OutDir`, `-NoOpen` | Report location; do not open the browser |
@@ -57,6 +63,10 @@ Options for `Get-PCHealth.ps1`:
   checked; the dashboard links to the support page instead.
 - **Naming the driver behind a blue screen needs `cdb.exe`.** Install the
   Windows SDK and tick only "Debugging Tools for Windows".
+- **CPU and motherboard sensors need the PawnIO driver.** Without low-level
+  access the sensor library returns placeholder values (0 C, 0 W, 1.55 V on
+  every core). The tool detects that, discards those readings and says so,
+  rather than judging them. Install PawnIO (pawnio.eu) and re-run.
 - **Windows Update search** can take a minute. Use `-Offline` to skip it.
 
 ## Files
