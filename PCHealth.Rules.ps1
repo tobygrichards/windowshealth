@@ -564,3 +564,134 @@ function Test-VirtualDevice($driver) {
     if ($driver.DeviceClass -notin 'DISPLAY', 'NET', 'USB') { return $false }
     return (('{0} {1}' -f $driver.DeviceName, $driver.DriverProviderName) -match 'Virtual|Parsec|TeamViewer|OpenVPN|TAP-Windows|WireGuard|Wintun|Sunshine|spacedesk|Duet|VPN')
 }
+
+# ------------------------------------------------------------------------------------------------
+# Comparing this run with the previous one
+
+# A finding's identity across runs: numbers are blanked so "3 warning(s)" and "4 warning(s)" are the same finding.
+function Get-FindingKey([string]$area, [string]$title) { return ('{0}|{1}' -f $area, ($title -replace '\d+([.,:]\d+)*', '#')) }
+
+# Name/value pairs of either a hashtable or an object read back from JSON.
+function Get-SnapProps($o) {
+    if ($null -eq $o) { return @() }
+    if ($o -is [System.Collections.IDictionary]) { return @($o.Keys | ForEach-Object { [pscustomobject]@{ Name = [string]$_; Value = $o[$_] } }) }
+    return @($o.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = $_.Value } })
+}
+function Get-SnapProp($o, [string]$name) {
+    $p = Get-SnapProps $o | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if ($p) { return $p.Value }
+    return $null
+}
+
+# What changed between two snapshots. Both are plain data (see the snapshot built in Get-PCHealth.ps1):
+#   generated 'yyyy-MM-dd HH:mm'; incidents, whea, tdr = lists of 'yyyy-MM-dd HH:mm|what' strings;
+#   drives = { key: { name, lifeUsed, writtenGB, hours, uncorrected, health } }; drivers = { device: version };
+#   rails = { name: volts }; bios; build; findings = [ { key, title, area } ]
+# Returns @{ Findings = [ @{ sev; title; detail } ]; DriverChanges = [ @(device, old, new, direction) ]; Days }
+function Compare-Snapshots($prev, $cur) {
+    $f = New-Object System.Collections.ArrayList
+    $dc = New-Object System.Collections.ArrayList
+    $days = 0.0
+    try { $days = ([datetime]$cur.generated - [datetime]$prev.generated).TotalDays } catch {}
+    $since = [string]$prev.generated
+
+    # events that happened after the previous run (older ones only appear because the look-back window moved)
+    foreach ($kind in @(@('incidents', 'crash or unexpected power loss', 'warn'), @('whea', 'hardware error record', 'warn'), @('tdr', 'graphics driver reset', 'warn'))) {
+        $old = @(Get-SnapProp $prev $kind[0]); $now = @(Get-SnapProp $cur $kind[0])
+        $new = @($now | Where-Object { $_ -and ($old -notcontains $_) -and (([string]$_).Split('|')[0] -gt $since) })
+        if ($new.Count -gt 0) {
+            [void]$f.Add(@{ sev = $kind[2]; title = ('{0} new {1}(s) since the last run' -f $new.Count, $kind[1]); detail = (($new | Select-Object -First 8 | ForEach-Object { ([string]$_) -replace '\|', ': ' }) -join '; ') })
+        }
+    }
+
+    $pd = Get-SnapProp $prev 'drives'; $cd = Get-SnapProp $cur 'drives'
+    foreach ($d in (Get-SnapProps $cd)) {
+        $o = Get-SnapProp $pd $d.Name; $n = $d.Value
+        if ($null -eq $o) { [void]$f.Add(@{ sev = 'info'; title = ('New drive detected: {0}' -f $n.name); detail = '' }); continue }
+        if ([string]$o.health -ne [string]$n.health) { [void]$f.Add(@{ sev = 'crit'; title = ('{0}: health status changed from {1} to {2}' -f $n.name, $o.health, $n.health); detail = '' }) }
+        if ($null -ne $o.uncorrected -and $null -ne $n.uncorrected -and [double]$n.uncorrected -gt [double]$o.uncorrected) {
+            [void]$f.Add(@{ sev = 'warn'; title = ('{0}: uncorrected errors rose from {1} to {2}' -f $n.name, $o.uncorrected, $n.uncorrected); detail = 'A count that keeps rising between runs is the clearest early sign of a failing drive or cable.' })
+        }
+        if ($null -ne $o.lifeUsed -and $null -ne $n.lifeUsed) {
+            $delta = [double]$n.lifeUsed - [double]$o.lifeUsed
+            if ($delta -ge 1) {
+                $sev = 'info'; if ($delta -ge 5) { $sev = 'warn' }
+                [void]$f.Add(@{ sev = $sev; title = ('{0}: rated life used rose from {1:N0} % to {2:N0} %' -f $n.name, $o.lifeUsed, $n.lifeUsed); detail = $(if ($days -ge 1) { 'Over {0:N0} day(s).' -f $days } else { '' }) })
+            }
+        }
+        if ($null -ne $o.writtenGB -and $null -ne $n.writtenGB -and $days -ge 1) {
+            $gb = [double]$n.writtenGB - [double]$o.writtenGB
+            if ($gb -ge 1 -and ($gb / $days) -ge 100) {
+                [void]$f.Add(@{ sev = 'info'; title = ('{0}: {1:N0} GB written since the last run, about {2:N0} GB a day' -f $n.name, $gb, ($gb / $days)); detail = 'A high daily write rate uses up an SSD''s rated life faster. Typical home use is well under 50 GB a day.' })
+            }
+        }
+    }
+    foreach ($d in (Get-SnapProps $pd)) {
+        if ($null -eq (Get-SnapProp $cd $d.Name)) { [void]$f.Add(@{ sev = 'warn'; title = ('Drive no longer detected: {0}' -f $d.Value.name); detail = 'It was present at the last run. If it was not removed on purpose, check its cables and whether it appears in the BIOS.' }) }
+    }
+
+    $pv = Get-SnapProp $prev 'drivers'
+    $down = 0; $up = 0
+    foreach ($d in (Get-SnapProps (Get-SnapProp $cur 'drivers'))) {
+        $o = Get-SnapProp $pv $d.Name
+        if ($null -eq $o -or [string]$o -eq [string]$d.Value) { continue }
+        $vo = ConvertTo-Ver ([string]$o); $vn = ConvertTo-Ver ([string]$d.Value)
+        $dir = 'Changed'
+        if ($vo -and $vn) { if ($vn -lt $vo) { $dir = 'DOWNGRADED'; $down++ } else { $dir = 'Updated'; $up++ } }
+        [void]$dc.Add(@($d.Name, [string]$o, [string]$d.Value, $dir))
+    }
+    if ($down -gt 0) {
+        [void]$f.Add(@{ sev = 'warn'; title = ('{0} driver(s) were replaced with an OLDER version since the last run' -f $down); detail = (($dc | Where-Object { $_[3] -eq 'DOWNGRADED' } | ForEach-Object { '{0}: {1} -> {2}' -f $_[0], $_[1], $_[2] }) -join '; ') + '. Unless you rolled these back yourself, something (usually Windows Update) has overwritten a newer driver.' })
+    }
+    if ($up -gt 0) { [void]$f.Add(@{ sev = 'info'; title = ('{0} driver(s) were updated since the last run' -f $up); detail = 'Listed in the table below. Worth knowing if a problem started after a particular date.' }) }
+
+    if ($prev.bios -and $cur.bios -and [string]$prev.bios -ne [string]$cur.bios) { [void]$f.Add(@{ sev = 'info'; title = ('BIOS changed from {0} to {1}' -f $prev.bios, $cur.bios); detail = 'A BIOS update resets settings such as memory profiles and fan curves to their defaults.' }) }
+    if ($prev.build -and $cur.build -and [string]$prev.build -ne [string]$cur.build) { [void]$f.Add(@{ sev = 'info'; title = ('Windows build changed from {0} to {1}' -f $prev.build, $cur.build); detail = '' }) }
+
+    $pr = Get-SnapProp $prev 'rails'
+    foreach ($r in (Get-SnapProps (Get-SnapProp $cur 'rails'))) {
+        $o = Get-SnapProp $pr $r.Name
+        if ($null -ne $o -and [double]$o -gt 0) {
+            $pct = 100 * ([double]$r.Value - [double]$o) / [double]$o
+            if ([math]::Abs($pct) -ge 2) { [void]$f.Add(@{ sev = 'info'; title = ('{0} rail reads {1:N2} V; it read {2:N2} V last time ({3:+0.0;-0.0} %)' -f $r.Name, $r.Value, $o, $pct); detail = 'A steady drift in one direction over several runs is worth more attention than any single reading.' }) }
+        }
+    }
+
+    $pk = @(@($prev.findings) | Where-Object { $_ } | ForEach-Object { [string]$_.key })
+    $ck = @(@($cur.findings) | Where-Object { $_ } | ForEach-Object { [string]$_.key })
+    $newF = @(@($cur.findings) | Where-Object { $_ -and ($pk -notcontains [string]$_.key) })
+    $gone = @(@($prev.findings) | Where-Object { $_ -and ($ck -notcontains [string]$_.key) })
+    if ($newF.Count -gt 0) { [void]$f.Add(@{ sev = 'warn'; title = ('{0} problem(s) reported now that were not reported last time' -f $newF.Count); detail = (($newF | Select-Object -First 8 | ForEach-Object { '[{0}] {1}' -f $_.area, $_.title }) -join '; ') }) }
+    if ($gone.Count -gt 0) { [void]$f.Add(@{ sev = 'ok'; title = ('{0} problem(s) from last time are no longer reported' -f $gone.Count); detail = (($gone | Select-Object -First 8 | ForEach-Object { '[{0}] {1}' -f $_.area, $_.title }) -join '; ') }) }
+
+    if (@($f | Where-Object { $_.sev -in 'warn', 'crit' }).Count -eq 0) {
+        [void]$f.Add(@{ sev = 'ok'; title = 'Nothing has got worse since the last run'; detail = $(if ($days -ge 1) { 'Compared with the run {0:N0} day(s) ago.' -f $days } else { 'Compared with the previous run earlier today.' }) })
+    }
+    return @{ Findings = $f; DriverChanges = $dc; Days = $days }
+}
+
+# ------------------------------------------------------------------------------------------------
+# Board makers whose driver listings cannot be read by a script
+
+# The support page for this exact board, for a person to open in a browser. '' when the maker is not known.
+function Get-BoardSupportUrl([string]$maker, [string]$product, [string]$cpuName) {
+    $model = ($product -replace '\(.*?\)', '').Trim()
+    if (-not $model) { return '' }
+    if ($maker -match 'Micro-Star|MSI') { return ('https://www.msi.com/Motherboard/{0}/support' -f (($model -replace '[^A-Za-z0-9]+', '-').Trim('-'))) }
+    if ($maker -match 'Gigabyte') { return ('https://www.gigabyte.com/Search?kw={0}' -f [uri]::EscapeDataString($model)) }
+    if ($maker -match 'ASRock') {
+        $platform = 'AMD'; if ($cpuName -match 'Intel') { $platform = 'Intel' }
+        return ('https://www.asrock.com/mb/{0}/{1}/index.asp#Download' -f $platform, [uri]::EscapeDataString($model))
+    }
+    return ''
+}
+
+# The installed drivers that a board maker would supply (sound, wired and wireless network, Bluetooth).
+function Select-BoardDeviceDrivers($drivers) {
+    return @($drivers | Where-Object {
+            $n = [string]$_.DeviceName
+            $_.DeviceClass -in 'MEDIA', 'NET', 'BLUETOOTH' -and
+            (('{0} {1}' -f $_.Manufacturer, $_.DriverProviderName) -match 'Realtek|Intel|MediaTek|Qualcomm|Marvell|Aquantia|Broadcom|Killer') -and
+            $n -notmatch 'Virtual|WAN Miniport|Wi-Fi Direct|Hyper-V|Loopback|Enumerator|RFCOMM|Display Audio|TAP-|VPN'
+        })
+}

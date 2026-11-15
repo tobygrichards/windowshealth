@@ -45,19 +45,21 @@ $global:FakeSensors = @(
 )
 
 # 3. stand-ins for Windows-only cmdlets
+$global:AudioVersion = '6.0.9000.1'
+$global:BoardMaker = 'ASUSTeK COMPUTER INC.'; $global:BoardProduct = 'ROG STRIX X570-E GAMING WIFI II'
 function global:Get-CimInstance {
     param($ClassName, $Namespace, $Filter, $ErrorAction)
     switch ($ClassName) {
         'Win32_Processor' { [pscustomobject]@{ Name = 'AMD Ryzen 9 5950X 16-Core Processor'; NumberOfCores = 16; NumberOfLogicalProcessors = 32; SocketDesignation = 'AM4'; MaxClockSpeed = 3400; LoadPercentage = 7 } }
         'Win32_VideoController' { [pscustomobject]@{ Name = 'AMD Radeon RX 9070 XT'; PNPDeviceID = 'PCI\VEN_1002'; DriverVersion = '32.0.31044.16'; DriverDate = (Get-Date).AddDays(-30); VideoModeDescription = '2560 x 1440'; Status = 'OK'; ConfigManagerErrorCode = 0 } }
         'Win32_OperatingSystem' { [pscustomobject]@{ Caption = 'Microsoft Windows 11 Pro'; BuildNumber = '26200'; InstallDate = (Get-Date).AddDays(-28); LastBootUpTime = (Get-Date).AddHours(-5); TotalVisibleMemorySize = 33554432; FreePhysicalMemory = 16777216 } }
-        'Win32_BaseBoard' { [pscustomobject]@{ Manufacturer = 'ASUSTeK COMPUTER INC.'; Product = 'ROG STRIX X570-E GAMING WIFI II'; Version = 'Rev X.0x' } }
+        'Win32_BaseBoard' { [pscustomobject]@{ Manufacturer = $global:BoardMaker; Product = $global:BoardProduct; Version = 'Rev X.0x' } }
         'Win32_BIOS' { [pscustomobject]@{ SMBIOSBIOSVersion = '5044'; ReleaseDate = (Get-Date).AddMonths(-10) } }
         'Win32_ComputerSystem' { [pscustomobject]@{ Manufacturer = 'System manufacturer'; Model = 'System Product Name' } }
         'Win32_PhysicalMemory' { [pscustomobject]@{ DeviceLocator = 'DIMM_A2'; Capacity = 17179869184; Manufacturer = 'G.Skill'; PartNumber = 'F4-3600C16'; Speed = 3600; ConfiguredClockSpeed = 2133 } }
         'Win32_PnPSignedDriver' {
             [pscustomobject]@{ DeviceName = 'AMD Radeon RX 9070 XT'; DeviceClass = 'DISPLAY'; DriverProviderName = 'Advanced Micro Devices, Inc.'; Manufacturer = 'Advanced Micro Devices, Inc.'; DriverVersion = '32.0.31044.16'; DriverDate = (Get-Date).AddDays(-30); IsSigned = $true; InfName = 'oem42.inf' }
-            [pscustomobject]@{ DeviceName = 'Realtek Audio'; DeviceClass = 'MEDIA'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '6.0.9000.1'; DriverDate = (Get-Date).AddYears(-5); IsSigned = $true; InfName = 'hdaudio.inf' }
+            [pscustomobject]@{ DeviceName = 'Realtek Audio'; DeviceClass = 'MEDIA'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = $global:AudioVersion; DriverDate = (Get-Date).AddYears(-5); IsSigned = $true; InfName = 'hdaudio.inf' }
             [pscustomobject]@{ DeviceName = 'Realtek Gaming 2.5GbE Family Controller'; DeviceClass = 'NET'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '1125.99.1.1'; DriverDate = (Get-Date).AddDays(-10); IsSigned = $true; InfName = 'oem7.inf' }
         }
         'Win32_Service' { if ($Namespace) { throw 'Invalid namespace' } }
@@ -124,7 +126,8 @@ function Has($id, $sev, $pattern) { [bool](@((Area $id).findings | Where-Object 
 # steps that crash show up as collection notes starting with the step name
 $stepCrashes = @($r.meta.errors | Where-Object { $_ -match '^(CPU|GPU|Memory|Drives|Power supply|Motherboard|Driver inventory|Crash analysis|Drivers):' })
 Expect ('no collection step crashed' + $(if ($stepCrashes) { ': ' + ($stepCrashes -join ' | ') } else { '' })) ($stepCrashes.Count -eq 0)
-Expect 'nine areas reported' (@($r.areas).Count -eq 9)
+Expect 'ten areas reported' (@($r.areas).Count -eq 10)
+Expect 'first run says there is nothing to compare with' (Has 'changes' 'info' 'first run')
 Expect 'dashboard embeds the data' ((Get-Content $html.FullName -Raw) -match '"computer"')
 Expect 'CPU model collected' ([bool](@((Area 'cpu').facts | Where-Object { $_.v -match '5950X' }).Count))
 Expect 'TjMax 90 used for 5950X' ([bool](@((Area 'cpu').facts | Where-Object { $_.k -match 'TjMax' -and $_.v -match '^90' }).Count))
@@ -164,7 +167,27 @@ if ($Online) {
     Expect 'offline: comparison reported as not made, not as no conflict' (Has 'drivers' 'gap' 'No driver could be compared')
 }
 
-# 5. a FAILED event-log query must not produce an all-clear
+# 5. a second run in the same folder reports what changed since the first
+$global:AudioVersion = '6.0.8000.1'                                        # audio driver replaced with an older one
+($global:FakeSensors | Where-Object { $_.Id -eq '/nvme/0' -and $_.Name -eq 'Percentage Used' }).Value = 2   # wear moved on
+$soon = (Get-Date).AddMinutes(5)                                            # a power loss after the first run
+$global:FakeEvents += (New-FakeEvent 'Service Control Manager' 7036 $soon 0)
+$global:FakeEvents += (New-FakeEvent $KG 12 $soon.AddMinutes(1) 0)
+$global:FakeEvents += (New-FakeEvent $KP 41 $soon.AddMinutes(1).AddSeconds(20) 0)
+$global:BoardMaker = 'Micro-Star International Co., Ltd'; $global:BoardProduct = 'B450 TOMAHAWK MAX (MS-7C02)'
+Start-Sleep -Seconds 1
+& $script -NoSensors -Offline -NoOpen -OutDir $OutDir *> $null
+$r = Get-Content (Get-ChildItem $OutDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
+Expect 'second run: new power loss since last run' (Has 'changes' 'warn' '^1 new crash or unexpected power loss')
+Expect 'second run: driver downgrade flagged' (Has 'changes' 'warn' 'replaced with an OLDER version')
+Expect 'second run: drive wear increase noted' (Has 'changes' 'info' 'rated life used rose from 0 % to 2 %')
+Expect 'second run: driver change table' (@(((Area 'changes').tables | Where-Object { $_.title -match 'changed version' }).rows).Count -eq 1)
+Expect 'second run: unchanged problems are not reported as new' (-not (Has 'changes' 'warn' 'problem\(s\) reported now'))
+Expect 'MSI board: not compared automatically, with the exact support page linked' ([bool](@((Area 'drivers').findings | Where-Object { $_.sev -eq 'gap' -and $_.title -match 'could not be compared automatically' -and $_.link -eq 'https://www.msi.com/Motherboard/B450-TOMAHAWK-MAX/support' }).Count))
+Expect 'MSI board: compare-by-hand table lists audio, LAN and BIOS' (@(((Area 'drivers').tables | Where-Object { $_.title -match '^Compare by hand' }).rows).Count -eq 3)
+$global:BoardMaker = 'ASUSTeK COMPUTER INC.'; $global:BoardProduct = 'ROG STRIX X570-E GAMING WIFI II'
+
+# 6. a FAILED event-log query must not produce an all-clear
 function global:Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) Write-Error -Message 'Access is denied' -ErrorId 'System.UnauthorizedAccessException' -ErrorAction Stop }
 $OutDir2 = $OutDir + '-denied'
 Remove-Item $OutDir2 -Recurse -Force -ErrorAction SilentlyContinue

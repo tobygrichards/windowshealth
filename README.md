@@ -70,6 +70,16 @@ Options for `Get-PCHealth.ps1`:
   board). Other board makers publish nothing machine-readable, so their
   devices are reported as "not checked", never as "no conflict". Vendors have
   no official API, so a failed lookup is also reported as not verified.
+- **Changes since the last run.** Each report saves a compact baseline. The
+  next run compares against the most recent report in `reports\` and shows new
+  crashes and power losses, drive wear and error counts that moved, drivers
+  updated or downgraded, BIOS and Windows build changes, and problems that
+  appeared or went away. Keep the `reports` folder for this to work.
+- **MSI, Gigabyte and ASRock boards are not compared automatically.** Their
+  support sites refuse requests that do not come from a person using a browser,
+  and this tool does not try to get round that. For those boards the dashboard
+  lists the installed sound, network, Bluetooth and BIOS versions with who
+  installed each, and links the board's support page, so you can compare by eye.
 - **Naming the driver behind a blue screen needs `cdb.exe`.** Install the
   Windows SDK and tick only "Debugging Tools for Windows".
 - **CPU and motherboard sensors need the PawnIO driver.** Without low-level

@@ -88,6 +88,8 @@ if (-not (Test-Path $rulesPath)) { Write-Error 'PCHealth.Rules.ps1 must be in th
 # ------------------------------------------------------------------ helpers
 $script:StepFailures = 0
 $script:AppxAll = $null
+# A compact record of this run, saved with the report so the next run can say what changed.
+$script:Snap = @{ generated = ''; bios = ''; build = ''; incidents = @(); whea = @(); tdr = @(); drives = @{}; drivers = @{}; rails = @{}; findings = @() }
 $script:Areas = [ordered]@{}
 $script:Errors = New-Object System.Collections.ArrayList
 $script:Sensors = New-Object System.Collections.ArrayList
@@ -192,7 +194,7 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
         $script:StepFailures++
         [void]$script:Errors.Add(('{0}: {1}' -f $name, $_.Exception.Message))
         Write-Host ('      (problem: {0})' -f $_.Exception.Message) -ForegroundColor DarkYellow
-        $areaOf = @{ 'CPU' = 'cpu'; 'GPU' = 'gpu'; 'Memory' = 'memory'; 'Drives' = 'drives'; 'Power supply' = 'psu'; 'Motherboard' = 'board'; 'Windows installation' = 'windows'; 'Crash analysis' = 'crash'; 'Drivers' = 'drivers' }
+        $areaOf = @{ 'CPU' = 'cpu'; 'GPU' = 'gpu'; 'Memory' = 'memory'; 'Drives' = 'drives'; 'Power supply' = 'psu'; 'Motherboard' = 'board'; 'Windows installation' = 'windows'; 'Crash analysis' = 'crash'; 'Drivers' = 'drivers'; 'Changes since last run' = 'changes' }
         if ($areaOf.ContainsKey($name)) {
             Add-Finding $areaOf[$name] 'gap' 'This section could not be completed' ('The tool hit an error part-way through this section, so what is shown here is incomplete: {0}' -f (Get-Short ([string]$_.Exception.Message) 200)) 'Please report this message so it can be fixed.' ''
         }
@@ -201,6 +203,7 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
 function Get-Sens([string]$hwTypePattern, [string]$type) {
     return @($script:Sensors | Where-Object { $_.Valid -and $_.HwType -match $hwTypePattern -and $_.Type -eq $type -and -not ($type -eq 'Temperature' -and $_.Name -match $script:RefSensor) })
 }
+New-Area 'changes' 'Since last run'
 New-Area 'crash' 'Crashes'
 New-Area 'cpu' 'CPU'
 New-Area 'gpu' 'GPU'
@@ -428,6 +431,7 @@ Invoke-Step 'CPU' {
     if ($load) { Add-Gauge 'cpu' 'Load' $load.Value '%' 100 'ok' '' }
 
     $script:Whea = Get-Ev 'System' 'Microsoft-Windows-WHEA-Logger' $null
+    $script:Snap.whea = @($script:Whea | ForEach-Object { '{0}|WHEA event {1}' -f (Format-Stamp $_.TimeCreated), $_.Id })
     $fatal = @($script:Whea | Where-Object { $_.Id -in 18, 20 })
     $corrected = @($script:Whea | Where-Object { $_.Id -eq 19 })
     if ($fatal.Count -gt 0) {
@@ -637,6 +641,8 @@ Invoke-Step 'Drives' {
                 ('It reports healthy{0}, and age alone is not a fault. But drives this old fail with less warning than a wear figure suggests.' -f $(if ($written) { ' with ' + $written + ' written' } else { '' })) `
                 'Make sure anything on it that matters is backed up elsewhere.' ''
         }
+        $dk = ([string]$d.SerialNumber).Trim(); if (-not $dk) { $dk = '{0}#{1}' -f $name.Trim(), $d.DeviceId }
+        $script:Snap.drives[$dk] = @{ name = $name.Trim(); lifeUsed = $pct; writtenGB = $(if ($wr) { [double]$wr.Value } else { $null }); hours = $poh; uncorrected = $(if ($r) { $u } else { $null }); health = $hs }
         [void]$rows.Add(@($name, [string]$d.MediaType, [string]$d.BusType, (Format-Size $d.Size), (New-Cell $hs $hsSev ''),
                 $wear, $written, $temp, $hours, $errs, [string]$d.FirmwareVersion))
     }
@@ -709,6 +715,7 @@ Invoke-Step 'Power supply' {
             $vd = Get-SensorVerdict $v $script:Sensors
             if ($vd[0] -in 'ok', 'warn', 'crit') {
                 $judged++
+                $script:Snap.rails[[string]$v.Name] = [double]$v.Value
                 $devLo = 100 * ($v.Min - $nominal) / $nominal; $devHi = 100 * ($v.Max - $nominal) / $nominal
                 $dev = $devLo; if ([math]::Abs($devHi) -gt [math]::Abs($devLo)) { $dev = $devHi }
                 $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V at worst' -f $dev, $nominal) $vd[0] ''
@@ -798,6 +805,7 @@ Invoke-Step 'Motherboard' {
     if ($cs) { Add-Fact 'board' 'System' ('{0} {1}' -f $cs.Manufacturer, $cs.Model) }
     if ($bios) {
         Add-Fact 'board' 'BIOS version' $bios.SMBIOSBIOSVersion
+        $script:Snap.bios = [string]$bios.SMBIOSBIOSVersion
         Add-Fact 'board' 'BIOS date' (Format-Day $bios.ReleaseDate)
         if ($bios.ReleaseDate) {
             $ageY = ($started - [datetime]$bios.ReleaseDate).TotalDays / 365
@@ -932,6 +940,7 @@ Invoke-Step 'Windows installation' {
         Add-Fact 'windows' 'Edition' $os.Caption
         Add-Fact 'windows' 'Version' ('{0} (build {1}.{2})' -f $cv.DisplayVersion, $os.BuildNumber, $cv.UBR)
         Add-Fact 'windows' 'Installed' (Format-Day $os.InstallDate)
+        $script:Snap.build = ('{0}.{1}' -f $os.BuildNumber, $cv.UBR)
         Add-Fact 'windows' 'Last boot' (Format-Stamp $os.LastBootUpTime)
         $up = ($started - $os.LastBootUpTime).TotalDays
         if ($up -ge 14) {
@@ -1185,13 +1194,16 @@ Invoke-Step 'Crash analysis' {
             }
         }
         [void]$rows.Add(@((Format-Stamp $alive), $ranFor, $offFor, $type, $codeTxt, $suspect, $cause, ($ev -join '; '), $dump))
+        $script:Snap.incidents += ('{0}|{1}' -f (Format-Stamp $alive), $type.t)
     }
     foreach ($b in ($bc | Where-Object { $null -ne $_ -and -not $usedBc.ContainsKey($_.RecordId) })) {
         $code = 0; if ($b.Message -match '0x([0-9a-fA-F]{8})') { $code = [Convert]::ToInt64($Matches[1], 16) }
         $info = Resolve-Bugcheck $code
         $codes += $code; $areasHit += $info[1]
+        $script:Snap.incidents += ('{0}|Blue screen' -f (Format-Stamp $b.TimeCreated))
         [void]$rows.Add(@((Format-Stamp $b.TimeCreated), '', '', (New-Cell 'Blue screen' 'crit' ''), ('0x{0:X} {1}' -f $code, $info[0]), $info[1], $info[2], '', ''))
     }
+    $script:Snap.tdr = @($tdr | ForEach-Object { '{0}|Graphics driver reset' -f (Format-Stamp $_.TimeCreated) })
     Add-Table 'crash' 'Timeline of crashes and unexpected power losses' @('Last sign of life', 'Had been running', 'Off for', 'What happened', 'Bugcheck code', 'Suspect', 'What it means', 'Evidence around it', 'Dump file') $rows `
         '"Last sign of life" is the last event Windows logged before it stopped, accurate to a few minutes. "Off for" runs from then until the PC was next started, so it includes any time spent asleep. "Suspect" names a component only where a logged event supports it; "None indicated" means the logs do not point anywhere.' $false
 
@@ -1338,6 +1350,7 @@ Invoke-Step 'Drivers' {
         $key = '{0}|{1}' -f $d.DeviceName, $d.DriverVersion
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = 1
+        $script:Snap.drivers[[string]$d.DeviceName] = [string]$d.DriverVersion
         $ageTxt = ''; $ageSev = ''
         if ($d.DriverDate) {
             $y = ($started - [datetime]$d.DriverDate).TotalDays / 365
@@ -1703,9 +1716,24 @@ Invoke-Step 'Drivers' {
         } catch {
             Add-Finding 'drivers' 'gap' 'The board maker''s driver listing could not be read' (Get-Short $_.Exception.Message 160) 'Compare audio, network, Wi-Fi and Bluetooth drivers by hand on the board''s support page.' $asusPage
         }
-    } elseif ($bMfr -and $bMfr -notmatch 'ASUS' -and -not $Offline) {
-        Add-Finding 'drivers' 'gap' ('Motherboard device drivers could not be compared with {0}''s versions' -f $bMfr) `
-            'Only ASUS publishes a driver listing this tool can read. Audio, network, Wi-Fi and Bluetooth drivers on this board were therefore not checked for Windows-versus-manufacturer conflicts.' 'Compare them by hand on the board''s support page (linked below).' ''
+    } elseif ($bMfr -and $bMfr -notmatch 'ASUS') {
+        $supUrl = Get-BoardSupportUrl $bMfr $bProd ([string]$cpu0.Name)
+        $brow = New-Rows; $fromWindows = 0; $done = @{}
+        foreach ($d in (Select-BoardDeviceDrivers $all | Sort-Object DeviceClass, DeviceName)) {
+            if ($done.ContainsKey([string]$d.DeviceName)) { continue }
+            $done[[string]$d.DeviceName] = 1
+            $o = Get-DriverOrigin ([string]$d.InfName) ([string]$d.DriverVersion) $script:DriverOrigins $script:WuDriverTitles
+            $win = $o[1] -in 'windows-inbox', 'windows-update'
+            if ($win) { $fromWindows++ }
+            [void]$brow.Add(@([string]$d.DeviceName, [string]$d.DriverVersion, (Format-Day $d.DriverDate), (New-Cell $o[0] $(if ($win) { 'info' } else { '' }) '')))
+        }
+        $bios = Get-Cim 'Win32_BIOS' | Select-Object -First 1
+        if ($bios) { [void]$brow.Add(@('Motherboard BIOS', [string]$bios.SMBIOSBIOSVersion, (Format-Day $bios.ReleaseDate), 'You (BIOS updates are manual)')) }
+        Add-Table 'drivers' ('Compare by hand against {0}''s support page' -f $bMfr) @('Device', 'Version in use', 'Dated', 'Installed by') $brow `
+            'These are the motherboard devices whose drivers the board maker publishes. Compare each version with the newest one listed on the support page for this exact board.' $false
+        Add-Finding 'drivers' 'gap' ('Motherboard device drivers could not be compared automatically with {0}''s versions' -f $bMfr) `
+            ('MSI, Gigabyte and ASRock''s support sites refuse requests that do not come from a person using a browser, and this tool does not try to get round that. So sound, network, Wi-Fi, Bluetooth and BIOS versions for this board were not checked for Windows-versus-manufacturer conflicts. The table below lists what is installed so you can compare by eye.{0}' -f $(if ($fromWindows -gt 0) { ' {0} of these device(s) are running a driver supplied by Windows rather than the maker: check those first.' -f $fromWindows } else { '' })) `
+            'Open the support page for this board (linked) and compare the versions in the "Compare by hand" table.' $supUrl
     }
 
     if ($conflicts -eq 0 -and $compared -gt 0) {
@@ -1734,6 +1762,8 @@ Invoke-Step 'Drivers' {
     elseif ($mfr -match 'ASRock') { $vendorUrl = 'https://www.asrock.com/support/index.asp' }
     $why = 'BIOS, audio (Realtek), LAN, Wi-Fi and board utilities. Board makers ship versions validated for this exact board.'
     if ($vendorUrl) { Add-Link ('Motherboard / system: {0} {1}' -f $mfr, $prod) 'Manufacturer support site' $vendorUrl $why }
+    $exactUrl = Get-BoardSupportUrl $mfr $prod $cpuName
+    if ($exactUrl) { Add-Link ('Motherboard / system: {0} {1}' -f $mfr, $prod) 'Support page for this exact board' $exactUrl 'Built from the board''s name; if it does not open, use the search link below.' }
     if ($prod) {
         $q = [uri]::EscapeDataString(('{0} {1} support drivers BIOS' -f $mfr, $prod))
         Add-Link ('Motherboard / system: {0} {1}' -f $mfr, $prod) 'Search for the exact support page' ('https://duckduckgo.com/?q=' + $q) 'Opens a web search for this exact model.'
@@ -1741,6 +1771,37 @@ Invoke-Step 'Drivers' {
     Add-Link 'Everything else' 'Windows Update > Optional updates' 'ms-settings:windowsupdate-optionalupdates' 'Safe fallback for devices whose maker publishes only through Microsoft.'
     Add-Table 'drivers' 'Where to get the latest drivers' @('Component', 'Source', 'Why this source') $script:Links `
         'Avoid third-party "driver updater" utilities; they are a common source of wrong or bundled drivers.' $false
+}
+
+# ------------------------------------------------------- changes since last run
+if (-not $OutDir) { $OutDir = Join-Path $PSScriptRoot 'reports' }
+Invoke-Step 'Changes since last run' {
+    $script:Snap.generated = $started.ToString('yyyy-MM-dd HH:mm')
+    $fl = New-Object System.Collections.ArrayList
+    foreach ($a in $script:Areas.Values) {
+        if ($a.id -eq 'changes') { continue }
+        foreach ($x in $a.findings) { if ($x.sev -in 'warn', 'crit') { [void]$fl.Add(@{ key = (Get-FindingKey $a.id $x.title); title = [string]$x.title; area = [string]$a.name }) } }
+    }
+    $script:Snap.findings = $fl
+    $prevFile = $null
+    if (Test-Path $OutDir) { $prevFile = Get-ChildItem $OutDir -Filter ('PCHealth-{0}-*.json' -f $env:COMPUTERNAME) -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1 }
+    if (-not $prevFile) {
+        Add-Finding 'changes' 'info' 'This is the first run on this PC, so there is nothing to compare with yet' 'A baseline has been saved with this report. From the next run onward this section shows what changed: new crashes and power losses, drive wear, drivers updated or downgraded, and problems that appeared or went away.' 'Keep the reports folder; the comparison reads the most recent report in it.' ''
+        return
+    }
+    $prev = $null
+    try { $prev = (Get-Content $prevFile.FullName -Raw | ConvertFrom-Json).snapshot } catch {}
+    if (-not $prev) {
+        Add-Finding 'changes' 'info' 'The previous report was made by an older version of this tool and cannot be compared' ('{0} has no saved baseline. One has been saved with this report, so the next run will show changes.' -f $prevFile.Name) '' ''
+        return
+    }
+    $cmp = Compare-Snapshots $prev ($script:Snap | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+    Add-Fact 'changes' 'Compared with the run of' ([string]$prev.generated)
+    Add-Fact 'changes' 'Previous report' $prevFile.Name
+    foreach ($x in $cmp.Findings) { Add-Finding 'changes' $x.sev $x.title $x.detail '' '' }
+    $crow = New-Rows
+    foreach ($c in $cmp.DriverChanges) { [void]$crow.Add(@([string]$c[0], [string]$c[1], [string]$c[2], (New-Cell ([string]$c[3]) $(if ($c[3] -eq 'DOWNGRADED') { 'warn' } else { '' }) ''))) }
+    Add-Table 'changes' 'Drivers that changed version' @('Device', 'Was', 'Now', 'Change') $crow '' $false
 }
 
 # ----------------------------------------------------------------- assemble
@@ -1776,9 +1837,9 @@ $report = [ordered]@{
         errors = $errList
     }
     areas = $areaList
+    snapshot = $script:Snap
 }
 
-if (-not $OutDir) { $OutDir = Join-Path $PSScriptRoot 'reports' }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $stamp = $started.ToString('yyyyMMdd-HHmmss')
 $base = Join-Path $OutDir ('PCHealth-{0}-{1}' -f $env:COMPUTERNAME, $stamp)

@@ -323,5 +323,66 @@ Check 'virtual: Parsec display' (Test-VirtualDevice $inst[3]) $true
 Check 'virtual: real network card is not' (Test-VirtualDevice $inst[4]) $false
 Check 'virtual: audio class is not listed' (Test-VirtualDevice $inst[2]) $false
 
+# ---- comparing two runs (snapshots are read back from JSON, as they are in real use)
+function Snap($h) { return ($h | ConvertTo-Json -Depth 8 | ConvertFrom-Json) }
+$before = @{
+    generated = '2026-11-01 10:00'; bios = '5044'; build = '26200.9974'
+    incidents = @('2026-10-28 14:00|Power lost while in use'); whea = @(); tdr = @()
+    drives = @{ 'S1' = @{ name = 'Samsung 990 PRO'; lifeUsed = 4; writtenGB = 60000; hours = 7800; uncorrected = 0; health = 'Healthy' }
+                'S2' = @{ name = 'Old SSD'; lifeUsed = 19; writtenGB = 99000; hours = 38000; uncorrected = 0; health = 'Healthy' } }
+    drivers = @{ 'Realtek Audio' = '6.0.9700.1'; 'NVIDIA GeForce RTX 5070 Ti' = '32.0.16.2114'; 'Realtek LAN' = '10.79.50.1003' }
+    rails = @{ '+12V' = 12.10 }
+    findings = @(@{ key = (Get-FindingKey 'drives' 'Volume F: is nearly full: 44 GB free (5 %)'); title = 'Volume F: is nearly full'; area = 'Drives' },
+                 @{ key = (Get-FindingKey 'windows' 'Windows component store is damaged (Repairable)'); title = 'Windows component store is damaged'; area = 'Windows' })
+}
+$same = Compare-Snapshots (Snap $before) (Snap $before)
+Check 'identical runs: one all-clear' @($same.Findings).Count 1
+Check 'identical runs: all-clear is ok' $same.Findings[0].sev 'ok'
+Check 'identical runs: no driver changes' @($same.DriverChanges).Count 0
+
+$after = @{
+    generated = '2026-11-15 10:00'; bios = '5220'; build = '26200.9974'
+    incidents = @('2026-10-28 14:00|Power lost while in use', '2026-11-10 21:30|Power lost while in use', '2026-10-20 09:00|Blue screen')
+    whea = @('2026-11-10 21:31|WHEA 18'); tdr = @()
+    drives = @{ 'S1' = @{ name = 'Samsung 990 PRO'; lifeUsed = 5; writtenGB = 63000; hours = 8100; uncorrected = 3; health = 'Healthy' }
+                'S3' = @{ name = 'New NVMe'; lifeUsed = 0; writtenGB = 10; hours = 5; uncorrected = 0; health = 'Healthy' } }
+    drivers = @{ 'Realtek Audio' = '6.0.9411.1'; 'NVIDIA GeForce RTX 5070 Ti' = '32.0.16.2200'; 'Realtek LAN' = '10.79.50.1003'; 'New Device' = '1.0' }
+    rails = @{ '+12V' = 11.70 }
+    findings = @(@{ key = (Get-FindingKey 'drives' 'Volume F: is nearly full: 31 GB free (3 %)'); title = 'Volume F: is nearly full'; area = 'Drives' },
+                 @{ key = (Get-FindingKey 'cpu' '1 fatal machine-check error(s) logged'); title = '1 fatal machine-check error(s) logged'; area = 'CPU' })
+}
+$cmp = Compare-Snapshots (Snap $before) (Snap $after)
+function HasChange($sev, $pattern) { [bool](@($cmp.Findings | Where-Object { $_.sev -eq $sev -and $_.title -match $pattern }).Count) }
+Check 'days between runs' ([math]::Round($cmp.Days)) 14
+Check 'one new incident (old-window blue screen and the known one are not counted)' (HasChange 'warn' '^1 new crash or unexpected power loss') $true
+Check 'new hardware error record' (HasChange 'warn' '^1 new hardware error record') $true
+Check 'uncorrected errors rose' (HasChange 'warn' 'uncorrected errors rose from 0 to 3') $true
+Check 'life used rose by one point is a note' (HasChange 'info' 'rated life used rose from 4 % to 5 %') $true
+Check 'high write rate noted' (HasChange 'info' '3,000 GB written since the last run, about 214 GB a day') $true
+Check 'drive vanished' (HasChange 'warn' 'Drive no longer detected: Old SSD') $true
+Check 'new drive' (HasChange 'info' 'New drive detected: New NVMe') $true
+Check 'driver downgrade is a warning' (HasChange 'warn' '^1 driver\(s\) were replaced with an OLDER version') $true
+Check 'driver update is a note' (HasChange 'info' '^1 driver\(s\) were updated') $true
+Check 'driver change table has both' @($cmp.DriverChanges).Count 2
+Check 'unchanged and new drivers are not listed as changes' (@($cmp.DriverChanges | Where-Object { $_[0] -in 'Realtek LAN', 'New Device' }).Count) 0
+Check 'BIOS change' (HasChange 'info' 'BIOS changed from 5044 to 5220') $true
+Check 'build unchanged is silent' (HasChange 'info' 'Windows build changed') $false
+Check 'rail drift' (HasChange 'info' '\+12V rail reads 11\.70 V; it read 12\.10 V') $true
+Check 'same finding with different numbers is not new' (@($cmp.Findings | Where-Object { $_.detail -match 'Volume F' }).Count) 0
+Check 'new problem reported' (HasChange 'warn' '^1 problem\(s\) reported now that were not reported last time') $true
+Check 'resolved problem reported' (HasChange 'ok' '^1 problem\(s\) from last time are no longer reported') $true
+Check 'no all-clear when things got worse' (HasChange 'ok' 'Nothing has got worse') $false
+# a report from before this feature has none of the fields
+$empty = Compare-Snapshots (Snap @{ generated = '2026-11-01 10:00' }) (Snap $after)
+Check 'old-format previous run does not throw' (@($empty.Findings).Count -gt 0) $true
+
+# ---- board maker support pages
+Check 'MSI support page' (Get-BoardSupportUrl 'Micro-Star International Co., Ltd' 'B450 TOMAHAWK MAX (MS-7C02)' 'AMD Ryzen 9 5900X') 'https://www.msi.com/Motherboard/B450-TOMAHAWK-MAX/support'
+Check 'ASRock support page' (Get-BoardSupportUrl 'ASRock' 'B550 Steel Legend' 'AMD Ryzen 5 5600X') 'https://www.asrock.com/mb/AMD/B550%20Steel%20Legend/index.asp#Download'
+Check 'ASRock Intel platform' ((Get-BoardSupportUrl 'ASRock' 'Z790 Pro RS' 'Intel(R) Core(TM) i7-13700K') -match '/mb/Intel/') $true
+Check 'Gigabyte search page' (Get-BoardSupportUrl 'Gigabyte Technology Co., Ltd.' 'B650 AORUS ELITE AX' 'AMD') 'https://www.gigabyte.com/Search?kw=B650%20AORUS%20ELITE%20AX'
+Check 'unknown maker' (Get-BoardSupportUrl 'Dell Inc.' '0XYZ' 'Intel') ''
+Check 'board devices: sound and LAN, not GPU audio or virtual' ((Select-BoardDeviceDrivers $inst | ForEach-Object { $_.DeviceName }) -join ',') 'Realtek High Definition Audio,Realtek PCIe GbE Family Controller'
+
 Write-Host ('{0} passed, {1} failed' -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $script:Fail
