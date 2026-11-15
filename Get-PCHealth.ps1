@@ -96,6 +96,8 @@ $script:SensorSource = ''
 $script:Links = New-Object System.Collections.ArrayList
 $script:WuPending = @()
 $script:WuSearched = $false
+$script:WuDriverTitles = @()
+$script:DriverOrigins = @{}
 
 function New-Area([string]$id, [string]$name) {
     $script:Areas[$id] = [ordered]@{
@@ -969,7 +971,9 @@ Invoke-Step 'Windows installation' {
             }
             $n = $searcher.GetTotalHistoryCount()
             if ($n -gt 0) {
-                $hist = @($searcher.QueryHistory(0, [math]::Min(300, $n)) | Where-Object { $_.Date -ge $Since })
+                $histAll = @($searcher.QueryHistory(0, [math]::Min(1000, $n)))
+                $script:WuDriverTitles = @($histAll | Where-Object { $_.ResultCode -eq 2 } | ForEach-Object { [string]$_.Title })
+                $hist = @($histAll | Where-Object { $_.Date -ge $Since })
                 # Triage failures: ignore ones that later succeeded, and separate driver updates for hardware that is gone.
                 $failed = @(); $stale = @(); $fixed = 0
                 $vendors = 'NVIDIA', 'Advanced Micro Devices|AMD', 'Intel', 'Realtek', 'Qualcomm', 'MediaTek', 'Broadcom', 'Logitech', 'Corsair', 'Synaptics', 'Samsung'
@@ -1214,6 +1218,17 @@ function Get-AmdIndex {
     }
     return $script:AmdIndex
 }
+# ASUS publishes a per-model listing (drivers and BIOS) for all its boards through its ROG support site.
+function Get-AsusListing([string]$kind, [string]$model, [int]$osId) {
+    $u = 'https://rog.asus.com/support/webapi/product/GetPD{0}?website=global&model={1}&cpu=' -f $kind, [uri]::EscapeDataString($model)
+    if ($kind -eq 'Drivers') { $u += ('&osid={0}' -f $osId) }
+    $j = (Get-Web $u) | ConvertFrom-Json
+    $out = @()
+    if ($j.Status -eq 'SUCCESS' -and $j.Result) {
+        foreach ($c in $j.Result.Obj) { foreach ($f in $c.Files) { $out += [pscustomobject]@{ Category = [string]$c.Name; Version = [string]$f.Version; Title = [string]$f.Title; Date = [string]$f.ReleaseDate } } }
+    }
+    return $out
+}
 function Find-AmdPage([string]$section, [string]$slug) {
     if (-not $slug) { return '' }
     $hit = @(Get-AmdIndex) | Where-Object { $_ -match ('/{0}/' -f $section) -and $_.EndsWith('/' + $slug + '.html') } | Select-Object -First 1
@@ -1243,6 +1258,16 @@ function Add-Link([string]$what, [string]$source, [string]$url, [string]$why) {
 Invoke-Step 'Drivers' {
     $keyClasses = 'DISPLAY', 'NET', 'MEDIA', 'BLUETOOTH', 'SYSTEM', 'HDC', 'SCSIADAPTER', 'USB', 'MONITOR', 'HIDCLASS', 'MOUSE', 'KEYBOARD', 'CAMERA', 'AUDIOENDPOINT', 'SOFTWARECOMPONENT', 'EXTENSION', 'FIRMWARE', 'BIOMETRIC'
     $all = @($script:AllDrv)
+    # Who installed each driver: read from Windows' own driver-installation log.
+    try {
+        $setupLog = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
+        if (Test-Path $setupLog) {
+            $fs = New-Object IO.FileStream($setupLog, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { $sr = New-Object IO.StreamReader($fs); $logText = $sr.ReadToEnd() } finally { $fs.Dispose() }
+            $script:DriverOrigins = Get-DriverOriginsFromSetupLog ($logText -split "`r?`n")
+        }
+    } catch { [void]$script:Errors.Add('Driver installation log could not be read: ' + $_.Exception.Message) }
+    Add-Fact 'drivers' 'Driver packages traced to their installer' $script:DriverOrigins.Count
     $third = @($all | Where-Object { $_.DriverProviderName -and $_.DriverProviderName -notmatch '^Microsoft' })
     $seen = @{}
     $rows = New-Rows
@@ -1261,9 +1286,10 @@ Invoke-Step 'Drivers' {
         $sig = New-Cell 'Yes' '' ''
         if ($d.IsSigned -eq $false) { $sig = New-Cell 'No' 'warn' ''; $unsigned++ }
         [void]$rows.Add(@([string]$d.DeviceName, [string]$d.DeviceClass, [string]$d.DriverProviderName, [string]$d.DriverVersion,
-                (Format-Day $d.DriverDate), (New-Cell $ageTxt $ageSev ''), $sig))
+                (Format-Day $d.DriverDate), (New-Cell $ageTxt $ageSev ''), $sig,
+                (Get-DriverOrigin ([string]$d.InfName) ([string]$d.DriverVersion) $script:DriverOrigins $script:WuDriverTitles)[0]))
     }
-    Add-Table 'drivers' ('Installed third-party drivers ({0})' -f $rows.Count) @('Device', 'Class', 'Provider', 'Version', 'Date', 'Age', 'Signed') $rows `
+    Add-Table 'drivers' ('Installed third-party drivers ({0})' -f $rows.Count) @('Device', 'Class', 'Provider', 'Version', 'Date', 'Age', 'Signed', 'Installed by') $rows `
         'Microsoft in-box drivers are omitted; they are serviced by Windows Update. Age alone is not a fault: many chipset and device drivers are legitimately years old.' $true
     Add-Fact 'drivers' 'Drivers in use' ('{0} total, {1} third-party' -f $all.Count, $third.Count)
     if ($unsigned -gt 0) { Add-Finding 'drivers' 'warn' ('{0} unsigned driver(s) in use' -f $unsigned) 'See the Signed column in the driver table.' 'Replace with a signed version from the manufacturer.' '' }
@@ -1388,10 +1414,8 @@ Invoke-Step 'Drivers' {
         foreach ($gpu in $script:Gpus) {
             $hit = $drvHist | Where-Object { $_.ResultCode -eq 2 -and $gpu.DriverVersion -and ([string]$_.Title).Contains([string]$gpu.DriverVersion) } | Select-Object -First 1
             if ($hit) {
-                $conflicts++
-                Add-Finding 'drivers' 'warn' ('The graphics driver in use for {0} was installed by Windows Update, not by the vendor installer' -f $gpu.Name) `
-                    ('Windows Update installed driver {0} on {1}, and that is the version now active. If you installed the vendor package yourself, Windows Update has replaced its driver underneath the vendor software, which then reports a version that no longer matches the driver (AMD Software shows this as a "version mismatch" error).' -f $gpu.DriverVersion, (Format-Stamp $hit.Date)) `
-                    'Stop Windows Update delivering drivers (see the note below), then reinstall the vendor package so driver and software match.' ''
+                Add-Finding 'drivers' 'info' ('The graphics driver in use for {0} was installed by Windows Update' -f $gpu.Name) `
+                    ('Windows Update installed driver {0} on {1}, and that is the version now active. Whether that is a conflict depends on how it compares with the manufacturer''s release: see the verdict in the "Windows versus manufacturer" table. Separately, if the vendor''s control software was installed from a different release, it can report a version mismatch.' -f $gpu.DriverVersion, (Format-Stamp $hit.Date)) '' ''
             }
         }
         Add-Table 'drivers' ('Drivers Windows Update installed in the last {0} days' -f $Days) @('When', 'Driver', 'Result') $hrow `
@@ -1402,15 +1426,15 @@ Invoke-Step 'Drivers' {
             'This is the Windows default. It is the mechanism behind most "Windows versus manufacturer driver" conflicts, typically a GPU driver being swapped for an older one.' `
             'If you manage GPU and chipset drivers yourself: Group Policy > Windows Update > "Do not include drivers with Windows Updates", or System Properties > Hardware > Device Installation Settings > No.' ''
     }
-    if ($conflicts -eq 0) {
-        Add-Finding 'drivers' 'ok' 'No Windows-versus-vendor driver conflict detected' 'No downgrade offers, no newer staged display driver than the active one.' '' ''
-    }
+    $compared = 0
 
     # ---- live GPU driver check
     $osId = 135; try { if ([int](Get-Cim 'Win32_OperatingSystem')[0].BuildNumber -lt 22000) { $osId = 57 } } catch {}
     $lrow = New-Rows
     foreach ($gpu in $script:Gpus) {
         $name = [string]$gpu.Name
+        $gDrv = $all | Where-Object { $_.DeviceClass -eq 'DISPLAY' -and $_.DeviceName -eq $name } | Select-Object -First 1
+        $gOrigin = @('Unknown', 'unknown'); if ($gDrv) { $gOrigin = Get-DriverOrigin ([string]$gDrv.InfName) ([string]$gpu.DriverVersion) $script:DriverOrigins $script:WuDriverTitles }
         $installed = [string]$gpu.DriverVersion; $latest = ''; $optional = ''; $src = ''; $note = ''
         $ageDays = 0; if ($gpu.DriverDate) { $ageDays = ($started - [datetime]$gpu.DriverDate).TotalDays }
         try {
@@ -1488,8 +1512,18 @@ Invoke-Step 'Drivers' {
             Add-Finding 'drivers' $sev ('{0}: could not verify the graphics driver against the vendor (installed driver dated {1})' -f $name, (Format-Day $gpu.DriverDate)) `
                 $(if ($note) { $note } elseif ($Offline) { 'Offline mode: no vendor lookup was made.' } else { 'The vendor lookup returned no version.' }) 'Check the vendor page by hand.' $src
         }
+        if ($latest) { $compared++ }
+        if ($verdict.t -eq 'Out of date' -and $gOrigin[1] -in 'windows-inbox', 'windows-update') {
+            $conflicts++
+            $verdict = New-Cell 'CONFLICT: Windows installed an older driver than the manufacturer offers' 'warn' ''
+            Add-Finding 'drivers' 'warn' ('CONFLICT: the graphics driver Windows installed for {0} is older than the manufacturer''s' -f $name) `
+                ('Active driver: {0}, installed by {1}. The manufacturer''s current release is {2}. Windows Update tends to lag the manufacturer by weeks or months, and it will put its own version back unless told not to.' -f $installed, $gOrigin[0], $latest) `
+                'Install the manufacturer''s driver from the link, then stop Windows Update replacing it (see the note about Windows Update and drivers in this section).' $src
+        } elseif ($verdict.t -eq 'Up to date' -and $gOrigin[1] -eq 'windows-update') {
+            $verdict = New-Cell 'No conflict: installed by Windows Update, and current' 'ok' ''
+        }
         $latestTxt = '-'; if ($latest) { $latestTxt = $latest; if ($optional) { $latestTxt += (' (optional: {0})' -f $optional) } }
-        [void]$lrow.Add(@($name, $installed, (Format-Day $gpu.DriverDate), $latestTxt, $verdict, (New-Cell 'Vendor download page' '' $src), $note))
+        [void]$lrow.Add(@($name, $installed, $gOrigin[0], (Format-Day $gpu.DriverDate), $latestTxt, $verdict, (New-Cell 'Vendor download page' '' $src), $note))
         if ($src) { Add-Link ('Graphics: {0}' -f $name) 'Vendor download page' $src 'Always take GPU drivers from the GPU vendor.' }
     }
 
@@ -1534,12 +1568,68 @@ Invoke-Step 'Drivers' {
             Add-Finding 'drivers' 'info' ('AMD chipset drivers {0} installed; could not verify against AMD' -f $cinst) $(if ($cnote) { $cnote } elseif ($Offline) { 'Offline mode.' } else { 'No version found on AMD''s page.' }) 'Check the AMD page by hand.' $csrc
         }
         $cdate = ''; if ($cprog -and $cprog.InstallDate -match '^(\d{4})(\d{2})(\d{2})$') { $cdate = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
-        [void]$lrow.Add(@('AMD chipset drivers', $(if ($cinst) { $cinst } else { '-' }), $cdate, $(if ($clatest) { $clatest } else { '-' }), $cver, (New-Cell 'AMD chipset page' '' $csrc), $cnote))
+        [void]$lrow.Add(@('AMD chipset drivers', $(if ($cinst) { $cinst } else { '-' }), $(if ($cinst) { 'AMD installer' } else { 'Windows (built in)' }), $cdate, $(if ($clatest) { $clatest } else { '-' }), $cver, (New-Cell 'AMD chipset page' '' $csrc), $cnote))
         Add-Link 'Chipset (AMD)' 'AMD chipset drivers' $csrc 'AMD''s page for this chipset. Includes the power plan and PCI drivers.'
     }
 
-    Add-Table 'drivers' 'Vendor drivers: installed versus latest' @('Component', 'Installed', 'Dated', 'Latest found', 'Verdict', 'Get it', 'Note') $lrow `
-        'Versions are read live from the vendors'' own download pages. They publish no official API, so a lookup can fail if a site changes; that is reported as "Not verified", never as "up to date".' $false
+    # ---- motherboard devices: the driver in use versus the board maker's listing for this exact model
+    $bMfr = ''; $bProd = ''
+    if ($script:Board) { $bMfr = [string]$script:Board.Manufacturer; $bProd = [string]$script:Board.Product }
+    if ($bMfr -match 'ASUS' -and $bProd -and -not $Offline) {
+        $asusPage = 'https://www.asus.com/support/download-center/'
+        try {
+            $slug = Get-AsusModelSlug $bProd
+            $asusOs = 52; if ($osId -eq 57) { $asusOs = 45 }
+            $listing = @(Get-AsusListing 'Drivers' $slug $asusOs)
+            if ($listing.Count -eq 0) {
+                Add-Finding 'drivers' 'gap' ('ASUS returned no driver listing for "{0}"' -f $bProd) 'Audio, network, Wi-Fi and Bluetooth drivers could not be compared with the board maker''s versions.' 'Compare by hand on the board''s support page.' $asusPage
+            }
+            foreach ($g in (Get-BoardDriverLatest $listing | Sort-Object Category, Vendor)) {
+                $done = @{}
+                foreach ($d in @(Find-BoardDriverMatch $g $all)) {
+                    if ($done.ContainsKey([string]$d.DeviceName)) { continue }
+                    $done[[string]$d.DeviceName] = 1
+                    $o = Get-DriverOrigin ([string]$d.InfName) ([string]$d.DriverVersion) $script:DriverOrigins $script:WuDriverTitles
+                    $cv = Get-ConflictVerdict $o[1] ([string]$d.DriverVersion) $g.Version $true
+                    $compared++
+                    if ($cv[2]) { $conflicts++ }
+                    if ($cv[0] -eq 'warn') {
+                        Add-Finding 'drivers' 'warn' ('{0}: {1}' -f $d.DeviceName, $cv[1]) `
+                            ('Driver in use: {0} (dated {1}), installed by: {2}. {3} lists {4} for this board, released {5}.' -f $d.DriverVersion, (Format-Day $d.DriverDate), $o[0], $bMfr, $g.Version, ($g.Date -replace '/', '-')) `
+                            'Download it from the board maker''s support page for this exact model. If Windows Update put the older one in, see the note about stopping it in this section.' $asusPage
+                    }
+                    [void]$lrow.Add(@([string]$d.DeviceName, [string]$d.DriverVersion, $o[0], (Format-Day $d.DriverDate), $g.Version, (New-Cell $cv[1] $cv[0] ''),
+                            (New-Cell 'ASUS support' '' $asusPage), ('ASUS lists: {0}' -f (Get-Short ($g.Title -replace '<[^>]+>.*$', '') 70))))
+                }
+            }
+            $bios = Get-Cim 'Win32_BIOS' | Select-Object -First 1
+            $newest = @(Get-AsusListing 'BIOS' $slug 0) | Where-Object { $_.Version -match '^\d+$' } | Sort-Object { [int]$_.Version } -Descending | Select-Object -First 1
+            if ($bios -and $newest -and [string]$bios.SMBIOSBIOSVersion -match '^\d+$') {
+                $bcell = New-Cell 'Up to date' 'ok' ''
+                if ([int]$newest.Version -gt [int]$bios.SMBIOSBIOSVersion) {
+                    $bcell = New-Cell 'Newer BIOS available' 'info' ''
+                    Add-Finding 'drivers' 'info' ('BIOS {0} installed; {1} is available (released {2})' -f $bios.SMBIOSBIOSVersion, $newest.Version, ($newest.Date -replace '/', '-')) `
+                        'A BIOS update is a choice, not a fix: take it when the changelog mentions CPU microcode, memory compatibility, stability or security, and never interrupt it.' 'Read the changelog on the board''s support page.' $asusPage
+                }
+                [void]$lrow.Add(@('Motherboard BIOS', [string]$bios.SMBIOSBIOSVersion, 'You (BIOS updates are manual)', (Format-Day $bios.ReleaseDate), [string]$newest.Version, $bcell, (New-Cell 'ASUS support' '' $asusPage), ''))
+            }
+        } catch {
+            Add-Finding 'drivers' 'gap' 'The board maker''s driver listing could not be read' (Get-Short $_.Exception.Message 160) 'Compare audio, network, Wi-Fi and Bluetooth drivers by hand on the board''s support page.' $asusPage
+        }
+    } elseif ($bMfr -and $bMfr -notmatch 'ASUS' -and -not $Offline) {
+        Add-Finding 'drivers' 'gap' ('Motherboard device drivers could not be compared with {0}''s versions' -f $bMfr) `
+            'Only ASUS publishes a driver listing this tool can read. Audio, network, Wi-Fi and Bluetooth drivers on this board were therefore not checked for Windows-versus-manufacturer conflicts.' 'Compare them by hand on the board''s support page (linked below).' ''
+    }
+
+    if ($conflicts -eq 0 -and $compared -gt 0) {
+        Add-Finding 'drivers' 'ok' 'No driver conflict found: nothing Windows installed is older than the manufacturer''s version' `
+            ('{0} device(s) were compared against a manufacturer source. Devices with no manufacturer source are not covered by this statement.' -f $compared) '' ''
+    } elseif ($compared -eq 0) {
+        Add-Finding 'drivers' 'gap' 'No driver could be compared with a manufacturer''s version' $(if ($Offline) { 'Offline mode: no manufacturer lookups were made.' } else { 'No manufacturer lookup returned a version.' }) '' ''
+    }
+
+    Add-Table 'drivers' 'Windows versus manufacturer: driver in use and latest available' @('Component', 'In use', 'Installed by', 'Dated', 'Manufacturer''s latest', 'Verdict', 'Get it', 'Note') $lrow `
+        '"Installed by" comes from Windows'' own driver-installation log. A CONFLICT means Windows (built-in driver or Windows Update) is supplying an older driver than the manufacturer publishes. Manufacturer versions are read live from AMD, NVIDIA and ASUS; they publish no official API, so a failed lookup is reported as not verified, never as up to date.' $false
 
     # ---- where to get everything else
     $cpuName = [string](Get-Cim 'Win32_Processor' | Select-Object -First 1).Name

@@ -4,7 +4,7 @@
 # prompt is skipped and fake sensor readings are injected. It proves the collector runs from start to
 # finish without a script error and produces a dashboard; it does not prove the real Windows queries
 # return what is expected. Exit code 0 = pass.
-param([string]$OutDir = (Join-Path ([IO.Path]::GetTempPath()) 'pchealth-smoke'))
+param([string]$OutDir = (Join-Path ([IO.Path]::GetTempPath()) 'pchealth-smoke'), [switch]$Online)
 
 $root = Split-Path -Parent $PSScriptRoot
 $src = Get-Content (Join-Path $root 'Get-PCHealth.ps1') -Raw
@@ -56,8 +56,9 @@ function global:Get-CimInstance {
         'Win32_ComputerSystem' { [pscustomobject]@{ Manufacturer = 'System manufacturer'; Model = 'System Product Name' } }
         'Win32_PhysicalMemory' { [pscustomobject]@{ DeviceLocator = 'DIMM_A2'; Capacity = 17179869184; Manufacturer = 'G.Skill'; PartNumber = 'F4-3600C16'; Speed = 3600; ConfiguredClockSpeed = 2133 } }
         'Win32_PnPSignedDriver' {
-            [pscustomobject]@{ DeviceName = 'AMD Radeon RX 9070 XT'; DeviceClass = 'DISPLAY'; DriverProviderName = 'Advanced Micro Devices, Inc.'; Manufacturer = 'Advanced Micro Devices, Inc.'; DriverVersion = '32.0.31044.16'; DriverDate = (Get-Date).AddDays(-30); IsSigned = $true }
-            [pscustomobject]@{ DeviceName = 'Realtek Audio'; DeviceClass = 'MEDIA'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '6.0.9000.1'; DriverDate = (Get-Date).AddYears(-5); IsSigned = $true }
+            [pscustomobject]@{ DeviceName = 'AMD Radeon RX 9070 XT'; DeviceClass = 'DISPLAY'; DriverProviderName = 'Advanced Micro Devices, Inc.'; Manufacturer = 'Advanced Micro Devices, Inc.'; DriverVersion = '32.0.31044.16'; DriverDate = (Get-Date).AddDays(-30); IsSigned = $true; InfName = 'oem42.inf' }
+            [pscustomobject]@{ DeviceName = 'Realtek Audio'; DeviceClass = 'MEDIA'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '6.0.9000.1'; DriverDate = (Get-Date).AddYears(-5); IsSigned = $true; InfName = 'hdaudio.inf' }
+            [pscustomobject]@{ DeviceName = 'Realtek Gaming 2.5GbE Family Controller'; DeviceClass = 'NET'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '1125.99.1.1'; DriverDate = (Get-Date).AddDays(-10); IsSigned = $true; InfName = 'oem7.inf' }
         }
         'Win32_WmiClassThatFails' { throw 'simulated failure' }
         default { if ($ErrorAction -eq 'Stop' -and $ClassName -match 'Battery|FailurePredict|AntiVirus') { throw 'Invalid class' } }
@@ -79,7 +80,8 @@ foreach ($n in 'Confirm-SecureBootUEFI', 'Get-Tpm', 'Get-HotFix', 'Get-MpCompute
 Remove-Item $OutDir -Recurse -Force -ErrorAction SilentlyContinue
 $script = [scriptblock]::Create($src)
 $runErrors = @()
-try { & $script -NoSensors -Offline -NoOpen -OutDir $OutDir -ErrorVariable +runErrors *> (Join-Path ([IO.Path]::GetTempPath()) 'pchealth-smoke.log') }
+$net = @{ Offline = (-not $Online) }
+try { & $script -NoSensors @net -NoOpen -OutDir $OutDir -ErrorVariable +runErrors *> (Join-Path ([IO.Path]::GetTempPath()) 'pchealth-smoke.log') }
 catch { Write-Host ('FAIL: script threw: {0}' -f $_); Write-Host $_.ScriptStackTrace; exit 1 }
 
 $json = Get-ChildItem $OutDir -Filter '*.json' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -113,6 +115,17 @@ Expect 'hard disk has no life-used figure' ($drv.rows[2][5] -eq 'n/a (HDD)')
 Expect 'no crashes reported as ok when log query succeeded' (Has 'crash' 'ok' 'No system crashes')
 Expect 'chipset package missing flagged' (Has 'drivers' 'warn' 'chipset driver package is not installed')
 Expect 'overall is critical' ($r.meta.overall -eq 'crit')
+$vs = (Area 'drivers').tables | Where-Object { $_.title -match '^Windows versus manufacturer' }
+if ($Online) {
+    # live lookups against AMD and ASUS: the simulated PC has a 5-year-old built-in Realtek audio driver
+    Expect 'online: audio driver from Windows flagged as a CONFLICT' (Has 'drivers' 'warn' 'Realtek Audio: CONFLICT')
+    Expect 'online: newer-than-listed LAN driver is not a conflict' (-not (Has 'drivers' 'warn' '2.5GbE'))
+    Expect 'online: comparison table has GPU, chipset, audio, LAN and BIOS rows' (@($vs.rows).Count -ge 5)
+    Expect 'online: BIOS compared' ([bool](@($vs.rows | Where-Object { $_[0] -eq 'Motherboard BIOS' }).Count))
+    $vs.rows | ForEach-Object { Write-Host ('      {0} | {1} | {2} | {4} | {5}' -f $_[0], $_[1], $_[2], $_[3], $_[4], $(if ($_[5].t) { $_[5].t } else { $_[5] })) }
+} else {
+    Expect 'offline: comparison reported as not made, not as no conflict' (Has 'drivers' 'gap' 'No driver could be compared')
+}
 
 # 5. a FAILED event-log query must not produce an all-clear
 function global:Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) Write-Error -Message 'Access is denied' -ErrorId 'System.UnauthorizedAccessException' -ErrorAction Stop }

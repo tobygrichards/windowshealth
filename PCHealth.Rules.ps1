@@ -247,3 +247,137 @@ function Get-OverallStatus($statuses) {
     if ($statuses -contains 'warn') { return 'warn' }
     return 'ok'
 }
+
+# ------------------------------------------------------------------------------------------------
+# Who installed a driver, and does it conflict with what the manufacturer offers?
+
+# Reads Windows' own driver-installation log (C:\Windows\INF\setupapi.dev.log) and returns, for each
+# third-party driver package (oemNN.inf), who last published it into the driver store:
+#   @{ 'oem12.inf' = @{ Origin = 'Windows Update' | 'Manufacturer installer'; When = '...'; By = 'setup.exe' } }
+# Only lines that record a package being PUBLISHED count, so a package merely considered during a
+# Windows Update pass is not mislabelled.
+function Get-DriverOriginsFromSetupLog($lines) {
+    $map = @{}
+    $isWu = $false; $when = ''; $by = ''; $infs = @()
+    foreach ($line in @($lines) + '>>>  [end]') {
+        if ($line.StartsWith('>>>  [')) {
+            foreach ($i in $infs) {
+                $origin = 'Manufacturer installer'; if ($isWu) { $origin = 'Windows Update' }
+                $map[$i] = @{ Origin = $origin; When = $when; By = $by }
+            }
+            $isWu = ($line -match '\(Windows Update\)'); $when = ''; $by = ''; $infs = @()
+            continue
+        }
+        if ($line -match '^>>>  Section start (\d{4}/\d{2}/\d{2})') { $when = $Matches[1]; continue }
+        if ($line -match '^\s+cmd:\s+(.+)$') {
+            $cmd = $Matches[1].Trim()
+            if ($cmd -match 'wuauserv|usocoreworker|wuauclt|musnotif') { $isWu = $true }
+            if ($cmd -match '([^\\/"]+\.exe)') { $by = $Matches[1].ToLower() }
+            continue
+        }
+        if ($line -match 'SoftwareDistribution\\Download') { $isWu = $true }
+        if ($line -match 'Publish' -and $line -match '(oem\d+\.inf)') { $infs += $Matches[1].ToLower() }
+    }
+    return $map
+}
+
+# Returns @(description, kind). kind: windows-inbox | windows-update | manufacturer | unknown
+# $wuTitles = titles of drivers Windows Update reports having installed (used when the log has no entry).
+function Get-DriverOrigin([string]$infName, [string]$version, [hashtable]$logOrigins, $wuTitles) {
+    if (-not $infName) { return @('Unknown', 'unknown') }
+    if ($infName -notmatch '^oem\d+\.inf$') { return @('Windows (built in)', 'windows-inbox') }
+    $lo = $null; if ($logOrigins) { $lo = $logOrigins[$infName.ToLower()] }
+    if ($lo) {
+        $when = ''; if ($lo.When) { $when = ' on ' + ($lo.When -replace '/', '-') }
+        if ($lo.Origin -eq 'Windows Update') { return @(('Windows Update' + $when), 'windows-update') }
+        $by = ''; if ($lo.By) { $by = ' (' + $lo.By + ')' }
+        return @(('Manufacturer installer' + $by + $when), 'manufacturer')
+    }
+    if ($version -and @($wuTitles | Where-Object { $_ -and ([string]$_).Contains($version) }).Count -gt 0) { return @('Windows Update', 'windows-update') }
+    return @('Unknown', 'unknown')
+}
+
+# Compares the installed version with the manufacturer's and says whether Windows is the reason it is older.
+# Returns @(severity, verdict text, isConflict).
+# $sameSeries: require the first version number to match before comparing (board drivers use unrelated
+# numbering for different chips or Windows versions, e.g. Realtek 10.x and 1125.x).
+function Get-ConflictVerdict([string]$kind, [string]$installed, [string]$vendor, [bool]$sameSeries) {
+    if (-not $vendor) { return @('', 'No manufacturer version to compare against', $false) }
+    $vi = ConvertTo-Ver $installed; $vl = ConvertTo-Ver $vendor
+    if (-not $vi -or -not $vl) { return @('gap', 'Could not compare: version numbers are not in a comparable form', $false) }
+    if ($sameSeries -and $vi.Major -ne $vl.Major) { return @('gap', 'Could not compare: the two versions use different numbering series', $false) }
+    $windows = $kind -in 'windows-inbox', 'windows-update'
+    if ($vl -gt $vi) {
+        if ($windows) { return @('warn', 'CONFLICT: Windows installed an older driver than the manufacturer offers', $true) }
+        if ($kind -eq 'manufacturer') { return @('warn', 'Out of date: installed from the manufacturer, but a newer one exists', $false) }
+        return @('warn', 'Older than the manufacturer''s; could not tell who installed it', $false)
+    }
+    if ($windows) { return @('ok', 'No conflict: Windows installed it, and it is not older than the manufacturer''s', $false) }
+    return @('ok', 'Up to date', $false)
+}
+
+# "ROG STRIX X570-E GAMING WIFI II" -> "ROG-STRIX-X570-E-GAMING-WIFI-II", the model key ASUS uses.
+function Get-AsusModelSlug([string]$product) {
+    return (($product.Trim() -replace '[^A-Za-z0-9]+', '-').Trim('-'))
+}
+
+# From a board maker's driver listing (objects with Category, Version, Title, Date) returns the newest
+# entry per device: one object per category + chip vendor + chip model.
+function Get-BoardDriverLatest($files) {
+    # Pass 1: classify every entry.
+    $entries = @()
+    foreach ($f in $files) {
+        $cat = ''
+        if ($f.Category -match '^LAN') { $cat = 'LAN' }
+        elseif ($f.Category -match 'Wireless|Wi-?Fi') { $cat = 'Wireless' }
+        elseif ($f.Category -match 'Bluetooth') { $cat = 'Bluetooth' }
+        elseif ($f.Category -match 'Audio') { $cat = 'Audio' }
+        if (-not $cat) { continue }
+        $vendor = ''
+        foreach ($v in 'Realtek', 'Intel', 'MediaTek', 'Qualcomm', 'Marvell', 'Aquantia', 'Broadcom', 'Killer') { if ($f.Title -match $v) { $vendor = $v; break } }
+        if (-not $vendor -or -not (ConvertTo-Ver $f.Version)) { continue }
+        $chip = ''
+        $words = $f.Title -replace '[vV]?\d+(\.\d+)+', ' '      # drop version numbers so 6.0.9700.1 is not read as a chip
+        if ($words -cmatch '\b(?:RTL)?(\d{4})[A-Z]{0,3}\b') { $chip = $Matches[1] }
+        elseif ($words -cmatch '\b(I\d{3})\b') { $chip = $Matches[1] }
+        $entries += [pscustomobject]@{ Category = $cat; Vendor = $vendor; Chip = $chip; Version = [string]$f.Version; Title = [string]$f.Title; Date = [string]$f.Date; Sole = $true }
+    }
+    # Pass 2: makers name the chip in some titles and not others ("Realtek RTL8125 LAN driver" / "Realtek LAN
+    # Driver"). When a vendor has exactly one named chip in a category, its unnamed entries are that chip too.
+    foreach ($e in $entries) {
+        if (-not $e.Chip) {
+            $named = @($entries | Where-Object { $_.Category -eq $e.Category -and $_.Vendor -eq $e.Vendor -and $_.Chip } | ForEach-Object { $_.Chip } | Select-Object -Unique)
+            if ($named.Count -eq 1) { $e.Chip = $named[0] }
+        }
+    }
+    # Pass 3: newest entry per category + vendor + chip.
+    $groups = @{}
+    foreach ($e in $entries) {
+        $key = '{0}|{1}|{2}' -f $e.Category, $e.Vendor, $e.Chip
+        if (-not $groups.ContainsKey($key) -or (ConvertTo-Ver $e.Version) -gt (ConvertTo-Ver $groups[$key].Version)) { $groups[$key] = $e }
+    }
+    $out = @($groups.Values)
+    foreach ($g in $out) { $g.Sole = (@($out | Where-Object { $_.Category -eq $g.Category -and $_.Vendor -eq $g.Vendor }).Count -eq 1) }
+    return $out
+}
+
+# The installed drivers (objects with DeviceName, DeviceClass, Manufacturer, DriverProviderName) that a
+# board-maker listing entry applies to. When the maker lists several chips from one vendor, a device is
+# only matched if its name contains the chip model; otherwise nothing is returned rather than a guess.
+function Find-BoardDriverMatch($group, $drivers) {
+    $wifi = 'Wi-?Fi|Wireless|802\.11|WLAN'
+    $cand = @($drivers | Where-Object {
+            $d = $_; $n = [string]$d.DeviceName; $classOk = $false
+            if ($group.Category -eq 'LAN') { $classOk = $d.DeviceClass -eq 'NET' -and $n -notmatch ($wifi + '|Bluetooth|Virtual|WAN Miniport|TAP|VPN|Hyper-V|Loopback') }
+            elseif ($group.Category -eq 'Wireless') { $classOk = $d.DeviceClass -eq 'NET' -and $n -match $wifi -and $n -notmatch 'Virtual|Direct' }
+            elseif ($group.Category -eq 'Bluetooth') { $classOk = $d.DeviceClass -eq 'BLUETOOTH' }
+            elseif ($group.Category -eq 'Audio') { $classOk = $d.DeviceClass -eq 'MEDIA' }
+            $classOk -and (('{0} {1} {2}' -f $d.Manufacturer, $d.DriverProviderName, $n) -match $group.Vendor)
+        })
+    if ($group.Chip) {
+        $exact = @($cand | Where-Object { ([string]$_.DeviceName) -match [regex]::Escape($group.Chip) })
+        if ($exact.Count -gt 0) { return $exact }
+    }
+    if ($group.Sole) { return $cand }
+    return @()
+}

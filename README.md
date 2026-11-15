@@ -60,12 +60,16 @@ Options for `Get-PCHealth.ps1`:
   voltage rails, a failed event-log query, discarded sensor values) the area
   is shown as "Partly checked" with a "Not checked" entry saying what is
   missing, rather than a green tick.
-- **Installed-versus-latest is checked live for AMD graphics, AMD chipset and
-  NVIDIA graphics**, by reading the vendor's own download page for the exact
-  product. Vendors publish no official API, so if a site changes the lookup is
-  reported as "Not verified", never as "up to date". Intel graphics is
-  best-effort. Motherboard-maker items (BIOS, audio, LAN) are not version
-  checked; the dashboard links to the support page instead.
+- **Windows-versus-manufacturer driver conflicts.** For each comparable device
+  the dashboard shows the driver in use, who installed it (read from Windows'
+  own driver-installation log, `setupapi.dev.log`), and the manufacturer's
+  latest. A CONFLICT is raised when Windows (a built-in driver or Windows
+  Update) is supplying an older driver than the manufacturer publishes.
+  Manufacturer versions are read live from AMD (graphics, chipset), NVIDIA
+  (graphics) and ASUS (audio, LAN, Wi-Fi, Bluetooth and BIOS for the exact
+  board). Other board makers publish nothing machine-readable, so their
+  devices are reported as "not checked", never as "no conflict". Vendors have
+  no official API, so a failed lookup is also reported as not verified.
 - **Naming the driver behind a blue screen needs `cdb.exe`.** Install the
   Windows SDK and tick only "Debugging Tools for Windows".
 - **CPU and motherboard sensors need the PawnIO driver.** Without low-level

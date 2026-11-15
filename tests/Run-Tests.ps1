@@ -146,5 +146,93 @@ Check 'overall ignores limited' (Get-OverallStatus @('ok', 'limited', 'unknown')
 Check 'overall warn' (Get-OverallStatus @('ok', 'warn', 'limited')) 'warn'
 Check 'overall crit' (Get-OverallStatus @('warn', 'crit')) 'crit'
 
+# ---- who installed a driver (setupapi.dev.log)
+$log = @(
+    '>>>  [Device Install (Windows Update) - PCI\VEN_1002&DEV_7550]',
+    '>>>  Section start 2026/11/15 10:07:12.123',
+    '      cmd: C:\WINDOWS\system32\svchost.exe -k netsvcs -p -s wuauserv',
+    '     dvi: Created Driver Node: InfName - c:\windows\inf\oem3.inf',
+    '     sto: {Setup Import Driver Package: c:\windows\softwaredistribution\download\install\u0412345.inf} 10:07:13.000',
+    "     cpy:           Published 'u0412345.inf_amd64_abc\u0412345.inf' to 'C:\WINDOWS\INF\oem42.inf'.",
+    '<<<  Section end 2026/11/15 10:07:30.000',
+    '>>>  [Setup Import Driver Package - C:\AMD\Chipset\amdgpio2.inf]',
+    '>>>  Section start 2026/10/18 14:00:00.000',
+    '      cmd: "C:\AMD\Chipset_Software\Setup.exe" -install',
+    "     cpy:           Published 'amdgpio2.inf_amd64_def\amdgpio2.inf' to 'C:\WINDOWS\INF\oem7.inf'.",
+    '<<<  Section end 2026/10/18 14:00:05.000',
+    '>>>  [Device Install (Hardware initiated) - USB\VID_046D]',
+    '>>>  Section start 2026/10/19 09:00:00.000',
+    '     dvi: Selected driver installs from section in c:\windows\inf\oem9.inf',
+    '<<<  Section end 2026/10/19 09:00:01.000')
+$o = Get-DriverOriginsFromSetupLog $log
+Check 'log: WU-published package' $o['oem42.inf'].Origin 'Windows Update'
+Check 'log: WU date' $o['oem42.inf'].When '2026/11/15'
+Check 'log: vendor-published package' $o['oem7.inf'].Origin 'Manufacturer installer'
+Check 'log: vendor installer name' $o['oem7.inf'].By 'setup.exe'
+Check 'log: package only considered by WU is not tagged' $o.ContainsKey('oem3.inf') $false
+Check 'log: plain device binding is not tagged' $o.ContainsKey('oem9.inf') $false
+Check 'origin inbox' (Get-DriverOrigin 'netrtwlane.inf' '1.0' $o @())[1] 'windows-inbox'
+Check 'origin WU from log' (Get-DriverOrigin 'OEM42.INF' '32.0.31044.16' $o @())[1] 'windows-update'
+Check 'origin WU text' (Get-DriverOrigin 'oem42.inf' '32.0.31044.16' $o @())[0] 'Windows Update on 2026-11-15'
+Check 'origin manufacturer' (Get-DriverOrigin 'oem7.inf' '2.2.0.130' $o @())[1] 'manufacturer'
+Check 'origin WU from history when log silent' (Get-DriverOrigin 'oem99.inf' '6.0.9700.1' $o @('Realtek - MEDIA - 6.0.9700.1'))[1] 'windows-update'
+Check 'origin unknown' (Get-DriverOrigin 'oem99.inf' '6.0.9700.1' $o @('Something else'))[1] 'unknown'
+Check 'log beats history' (Get-DriverOrigin 'oem7.inf' '2.2.0.130' $o @('AMD - System - 2.2.0.130'))[1] 'manufacturer'
+
+# ---- conflict verdicts
+Check 'conflict: WU older than manufacturer' (Get-ConflictVerdict 'windows-update' '6.0.9411.1' '6.0.9700.1' $true)[2] $true
+Check 'conflict severity' (Get-ConflictVerdict 'windows-update' '6.0.9411.1' '6.0.9700.1' $true)[0] 'warn'
+Check 'conflict: inbox older than manufacturer' (Get-ConflictVerdict 'windows-inbox' '1.0.0.1' '1.2.0.0' $true)[2] $true
+Check 'no conflict: WU same as manufacturer' (Get-ConflictVerdict 'windows-update' '6.0.9700.1' '6.0.9700.1' $true)[0] 'ok'
+Check 'no conflict: WU newer than manufacturer' (Get-ConflictVerdict 'windows-update' '6.0.9800.1' '6.0.9700.1' $true)[2] $false
+Check 'manufacturer-installed but old is not a conflict' (Get-ConflictVerdict 'manufacturer' '6.0.9411.1' '6.0.9700.1' $true)[2] $false
+Check 'manufacturer-installed but old still warns' (Get-ConflictVerdict 'manufacturer' '6.0.9411.1' '6.0.9700.1' $true)[0] 'warn'
+Check 'different series not compared' (Get-ConflictVerdict 'windows-update' '10.72.524.2024' '1125.27.50.919' $true)[0] 'gap'
+Check 'series check off for package versions' (Get-ConflictVerdict 'windows-update' '25.9.1' '26.10.1' $false)[2] $true
+Check 'no vendor version' (Get-ConflictVerdict 'windows-update' '1.0' '' $true)[0] ''
+Check 'unparsable version' (Get-ConflictVerdict 'windows-update' 'abc' '1.0' $true)[0] 'gap'
+
+# ---- board maker listing
+Check 'asus slug' (Get-AsusModelSlug 'ROG STRIX X570-E GAMING WIFI II') 'ROG-STRIX-X570-E-GAMING-WIFI-II'
+Check 'asus slug brackets' (Get-AsusModelSlug 'TUF GAMING X570-PLUS (WI-FI)') 'TUF-GAMING-X570-PLUS-WI-FI'
+$listing = @(
+    [pscustomobject]@{ Category = 'LAN'; Version = '1125.21.903.2024'; Title = 'Realtek LAN Driver V1125.21.903.2024 for Windows 11 64-bit.'; Date = '2024/09/18' },
+    [pscustomobject]@{ Category = 'LAN'; Version = '1125.27.50.919'; Title = 'Realtek RTL8125 LAN driver v1125.27.50.919 for Windows 11 64-bit.'; Date = '2025/12/31' },
+    [pscustomobject]@{ Category = 'LAN'; Version = '14.1.3.0'; Title = 'Intel I211 Gigabit Ethernet Driver V14.1.3.0'; Date = '2025/01/01' },
+    [pscustomobject]@{ Category = 'Audio'; Version = '6.0.9700.1'; Title = 'Realtek Audio Driver v6.0.9700.1 for windows 11 64-bit.'; Date = '2024/09/24' },
+    [pscustomobject]@{ Category = 'Audio'; Version = '6.0.9411.1'; Title = 'Realtek Audio Driver V6.0.9411.1 For Windows 10/11 64-bit.'; Date = '2022/10/21' },
+    [pscustomobject]@{ Category = 'Wireless'; Version = '3.5.0.1349'; Title = 'MediaTek WiFi Driver V3.5.0.1349 For Windows 10/11 64-bit.'; Date = '2026/03/06' },
+    [pscustomobject]@{ Category = 'Bluetooth'; Version = '1.1044.0.556'; Title = 'MediaTek Bluetooth Driver V1.1044.0.556'; Date = '2026/03/06' },
+    [pscustomobject]@{ Category = 'Software and Utility'; Version = '7.13.0'; Title = 'WinRAR v7.13.0'; Date = '2025/08/27' },
+    [pscustomobject]@{ Category = 'VGA Drivers'; Version = '31.0.21924.61'; Title = 'AMD VGA driver'; Date = '2026/04/28' })
+$latest = Get-BoardDriverLatest $listing
+Check 'listing: utilities and VGA ignored' (@($latest | Where-Object { $_.Category -notin 'LAN', 'Audio', 'Wireless', 'Bluetooth' }).Count) 0
+Check 'listing: newest audio' ($latest | Where-Object { $_.Category -eq 'Audio' }).Version '6.0.9700.1'
+Check 'listing: intel chip' ($latest | Where-Object { $_.Vendor -eq 'Intel' }).Chip 'I211'
+Check 'listing: windows "11" is not a chip' ($latest | Where-Object { $_.Category -eq 'Audio' }).Chip ''
+$pc = @(
+    [pscustomobject]@{ DeviceName = 'Realtek Gaming 2.5GbE Family Controller'; DeviceClass = 'NET'; Manufacturer = 'Realtek'; DriverProviderName = 'Realtek' },
+    [pscustomobject]@{ DeviceName = 'Intel(R) I211 Gigabit Network Connection'; DeviceClass = 'NET'; Manufacturer = 'Intel'; DriverProviderName = 'Microsoft' },
+    [pscustomobject]@{ DeviceName = 'MediaTek Wi-Fi 6E MT7922 160MHz Wireless LAN Card'; DeviceClass = 'NET'; Manufacturer = 'MediaTek, Inc.'; DriverProviderName = 'MediaTek, Inc.' },
+    [pscustomobject]@{ DeviceName = 'MediaTek Bluetooth Adapter'; DeviceClass = 'BLUETOOTH'; Manufacturer = 'MediaTek, Inc.'; DriverProviderName = 'MediaTek, Inc.' },
+    [pscustomobject]@{ DeviceName = 'Bluetooth Device (RFCOMM Protocol TDI)'; DeviceClass = 'BLUETOOTH'; Manufacturer = 'Microsoft'; DriverProviderName = 'Microsoft' },
+    [pscustomobject]@{ DeviceName = 'Realtek(R) Audio'; DeviceClass = 'MEDIA'; Manufacturer = 'Realtek'; DriverProviderName = 'Realtek Semiconductor Corp.' },
+    [pscustomobject]@{ DeviceName = 'AMD High Definition Audio Device'; DeviceClass = 'MEDIA'; Manufacturer = 'Advanced Micro Devices'; DriverProviderName = 'Advanced Micro Devices' })
+function M($cat, $vendor) { $g = $latest | Where-Object { $_.Category -eq $cat -and $_.Vendor -eq $vendor } | Sort-Object { ConvertTo-Ver $_.Version } -Descending | Select-Object -First 1; @(Find-BoardDriverMatch $g $pc) }
+Check 'match audio to Realtek only' ((M 'Audio' 'Realtek') | ForEach-Object { $_.DeviceName }) 'Realtek(R) Audio'
+Check 'match intel LAN by chip' ((M 'LAN' 'Intel') | ForEach-Object { $_.DeviceName }) 'Intel(R) I211 Gigabit Network Connection'
+Check 'match wifi, not wired or bluetooth' ((M 'Wireless' 'MediaTek') | ForEach-Object { $_.DeviceName }) 'MediaTek Wi-Fi 6E MT7922 160MHz Wireless LAN Card'
+Check 'match bluetooth adapter, not Microsoft stack' ((M 'Bluetooth' 'MediaTek') | ForEach-Object { $_.DeviceName }) 'MediaTek Bluetooth Adapter'
+# "Realtek LAN Driver" and "Realtek RTL8125 LAN driver" are the same chip: one group, newest version, matched by vendor
+Check 'unnamed entries adopt the only named chip' (@($latest | Where-Object { $_.Category -eq 'LAN' -and $_.Vendor -eq 'Realtek' }).Count) 1
+Check 'merged Realtek LAN is newest' ($latest | Where-Object { $_.Category -eq 'LAN' -and $_.Vendor -eq 'Realtek' }).Version '1125.27.50.919'
+Check 'Realtek LAN matched though device name has no chip' ((M 'LAN' 'Realtek') | ForEach-Object { $_.DeviceName }) 'Realtek Gaming 2.5GbE Family Controller'
+# two differently named chips from one vendor: a device whose name shows neither is not guessed
+$two = Get-BoardDriverLatest @(
+    [pscustomobject]@{ Category = 'LAN'; Version = '1125.27.50.919'; Title = 'Realtek RTL8125 LAN driver'; Date = '' },
+    [pscustomobject]@{ Category = 'LAN'; Version = '10.72.524.2024'; Title = 'Realtek RTL8168 LAN driver'; Date = '' })
+Check 'two named chips stay separate' @($two).Count 2
+Check 'ambiguous device is not guessed' (@($two | ForEach-Object { Find-BoardDriverMatch $_ $pc }).Count) 0
+
 Write-Host ('{0} passed, {1} failed' -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $script:Fail
