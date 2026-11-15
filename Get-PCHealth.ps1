@@ -192,6 +192,10 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
         $script:StepFailures++
         [void]$script:Errors.Add(('{0}: {1}' -f $name, $_.Exception.Message))
         Write-Host ('      (problem: {0})' -f $_.Exception.Message) -ForegroundColor DarkYellow
+        $areaOf = @{ 'CPU' = 'cpu'; 'GPU' = 'gpu'; 'Memory' = 'memory'; 'Drives' = 'drives'; 'Power supply' = 'psu'; 'Motherboard' = 'board'; 'Windows installation' = 'windows'; 'Crash analysis' = 'crash'; 'Drivers' = 'drivers' }
+        if ($areaOf.ContainsKey($name)) {
+            Add-Finding $areaOf[$name] 'gap' 'This section could not be completed' ('The tool hit an error part-way through this section, so what is shown here is incomplete: {0}' -f (Get-Short ([string]$_.Exception.Message) 200)) 'Please report this message so it can be fixed.' ''
+        }
     }
 }
 function Get-Sens([string]$hwTypePattern, [string]$type) {
@@ -470,7 +474,8 @@ Invoke-Step 'GPU' {
         Add-Finding 'gpu' 'gap' 'GPU temperature could not be read' $(if ($script:SensorNote) { $script:SensorNote } else { 'The sensor library returned no GPU temperature.' }) '' ''
     }
     foreach ($hwName in @($gt | Select-Object -ExpandProperty Hw -Unique)) {
-        $t = $gt | Where-Object { $_.Hw -eq $hwName -and $_.Name -notmatch 'Hot ?Spot' } | Sort-Object Max -Descending | Select-Object -First 1
+        $t = $gt | Where-Object { $_.Hw -eq $hwName -and $_.Name -match '^GPU Core$' } | Select-Object -First 1
+        if (-not $t) { $t = $gt | Where-Object { $_.Hw -eq $hwName -and $_.Name -notmatch 'Hot ?Spot' } | Sort-Object Max -Descending | Select-Object -First 1 }
         if (-not $t) { continue }
         $vd = Get-SensorVerdict $t $script:Sensors
         $sev = 'ok'; if ($vd[0] -in 'warn', 'crit') { $sev = $vd[0] }
@@ -480,7 +485,15 @@ Invoke-Step 'GPU' {
                 'Check the fans spin, clear dust from the heatsink, and check case airflow.' ''
         }
     }
-    foreach ($f in (Get-Sens '^Gpu' 'Fan')) { Add-Fact 'gpu' ('{0} {1}' -f $f.Hw, $f.Name) ('{0:N0} RPM' -f $f.Value) }
+    foreach ($f in (Get-Sens '^Gpu' 'Fan')) {
+        Add-Fact 'gpu' ('{0} {1}' -f $f.Hw, $f.Name) $(if ($f.Value -le 0) { '0 RPM (normal: most cards stop their fans when cool)' } else { '{0:N0} RPM' -f $f.Value })
+    }
+    foreach ($x in ($gt | Where-Object { $_.Name -notmatch '^GPU Core$' })) { Add-Fact 'gpu' ('{0} temperature' -f $x.Name) ('{0:N0} C' -f $x.Max) }
+    $gpw = Get-Sens '^Gpu' 'Power' | Sort-Object Max -Descending | Select-Object -First 1
+    if ($gpw) { Add-Fact 'gpu' 'Power draw now' ('{0:N0} W' -f $gpw.Value) }
+    $gmu = Get-Sens '^Gpu' 'SmallData' | Where-Object { $_.Name -eq 'GPU Memory Used' } | Select-Object -First 1
+    $gmt = Get-Sens '^Gpu' 'SmallData' | Where-Object { $_.Name -eq 'GPU Memory Total' } | Select-Object -First 1
+    if ($gmu -and $gmt -and $gmt.Value -gt 0) { Add-Fact 'gpu' 'Graphics memory in use' ('{0:N1} of {1:N1} GB' -f ($gmu.Value / 1024), ($gmt.Value / 1024)) }
 
     $tdr = Get-Ev 'System' 'Display' @(4101)
     $drvErr = @()
@@ -512,12 +525,17 @@ Invoke-Step 'GPU' {
 # ------------------------------------------------------------------- memory
 Invoke-Step 'Memory' {
     $dimms = Get-Cim 'Win32_PhysicalMemory'
+    $script:RamText = ''
+    $ramTotal = 0; foreach ($d in $dimms) { $ramTotal += [double]$d.Capacity }
+    if ($ramTotal -gt 0) { $script:RamText = ('{0} RAM' -f (Format-Size $ramTotal)) }
     $rows = New-Rows
     $slow = $false
     foreach ($d in $dimms) {
         $cfg = $d.ConfiguredClockSpeed
         if ($d.Speed -and $cfg -and $cfg -lt $d.Speed) { $slow = $true }
-        [void]$rows.Add(@([string]$d.DeviceLocator, (Format-Size $d.Capacity), ([string]$d.Manufacturer).Trim(),
+        $slot = [string]$d.DeviceLocator
+        if (@($dimms | Where-Object { $_.DeviceLocator -eq $d.DeviceLocator }).Count -gt 1 -and $d.BankLabel) { $slot = ('{0} ({1})' -f $d.DeviceLocator, $d.BankLabel) }
+        [void]$rows.Add(@($slot, (Format-Size $d.Capacity), (Get-MemoryMaker ([string]$d.Manufacturer) ([string]$d.PartNumber)),
                 ([string]$d.PartNumber).Trim(), ('{0} MHz' -f $d.Speed), ('{0} MHz' -f $cfg)))
     }
     Add-Table 'memory' 'Modules' @('Slot', 'Size', 'Maker', 'Part number', 'Rated', 'Running at') $rows '' $false
@@ -573,9 +591,8 @@ Invoke-Step 'Drives' {
         $wr = $ls | Where-Object { $_.Name -match 'Data Written|Total Bytes Written|Host Writes' } | Select-Object -First 1
         if ($wr) { if ($wr.Value -ge 1000) { $written = ('{0:N1} TB' -f ($wr.Value / 1000)) } else { $written = ('{0:N0} GB' -f $wr.Value) } }
         $pct = $null
-        $pu = $ls | Where-Object { $_.Name -match 'Percentage Used' } | Select-Object -First 1
-        $rl = $ls | Where-Object { $_.Name -match 'Remaining Life' } | Select-Object -First 1
-        if ($pu) { $pct = $pu.Value } elseif ($rl) { $pct = 100 - $rl.Value } elseif ($r -and $null -ne $r.Wear) { $pct = [double]$r.Wear }
+        $winWear = $null; if ($r -and $null -ne $r.Wear) { $winWear = $r.Wear }
+        $pct = Get-DriveLifeUsed $ls $winWear ([string]$d.BusType)
         if ($d.MediaType -eq 'HDD') { $wear = 'n/a (HDD)' }
         elseif ($null -ne $pct) {
             if ($pct -lt 1) { $wear = 'under 1 %' } else { $wear = ('{0:N0} %' -f $pct) }
@@ -599,13 +616,26 @@ Invoke-Step 'Drives' {
                     Add-Finding 'drives' 'warn' ('{0} is at {1} C' -f $name, $r.Temperature) 'That is close to the temperature at which the drive starts throttling itself.' 'Check airflow over the drive; M.2 drives under a GPU often benefit from a heatsink.' ''
                 }
             }
-            if ($r.PowerOnHours) { $hours = ('{0:N0} h' -f $r.PowerOnHours) }
             $u = [double]$r.ReadErrorsUncorrected + [double]$r.WriteErrorsUncorrected
             $errs = [string]$u
             if ($u -gt 0) {
                 Add-Finding 'drives' 'warn' ('{0} has {1} uncorrected read/write error(s)' -f $name, $u) `
                     'The drive failed to recover data on at least one operation over its lifetime.' 'Check the cable (SATA), back up, and watch whether the number rises between runs.' ''
             }
+        }
+        # fill from the drive's own SMART data whatever Windows left blank
+        $poh = 0; if ($r -and $r.PowerOnHours) { $poh = [double]$r.PowerOnHours }
+        if (-not $poh) { $ph = $ls | Where-Object { $_.Name -match 'Power On Hours' } | Select-Object -First 1; if ($ph) { $poh = [double]$ph.Value } }
+        if ($poh) { $hours = ('{0:N0} h' -f $poh) }
+        if (-not $temp) {
+            $lt = $ls | Where-Object { $_.Type -eq 'Temperature' -and $_.Name -notmatch $script:RefSensor } | Sort-Object { $_.Name -notmatch 'Composite|^Temperature$' } | Select-Object -First 1
+            if ($lt) { $temp = ('{0:N0} C' -f $lt.Value) }
+        }
+        $ageNote = Get-DriveAgeNote $poh
+        if ($ageNote) {
+            Add-Finding 'drives' 'info' ('{0} is an old drive: {1}' -f $name.Trim(), $ageNote) `
+                ('It reports healthy{0}, and age alone is not a fault. But drives this old fail with less warning than a wear figure suggests.' -f $(if ($written) { ' with ' + $written + ' written' } else { '' })) `
+                'Make sure anything on it that matters is backed up elsewhere.' ''
         }
         [void]$rows.Add(@($name, [string]$d.MediaType, [string]$d.BusType, (Format-Size $d.Size), (New-Cell $hs $hsSev ''),
                 $wear, $written, $temp, $hours, $errs, [string]$d.FirmwareVersion))
@@ -635,10 +665,13 @@ Invoke-Step 'Drives' {
     try {
         foreach ($v in @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter -and $_.Size -gt 0 -and $_.DriveType -eq 'Fixed' } | Sort-Object DriveLetter)) {
             $freePct = 100 * $v.SizeRemaining / $v.Size
-            $sev = 'ok'; if ($freePct -lt 5) { $sev = 'crit' } elseif ($freePct -lt 10) { $sev = 'warn' }
+            $isSys = ([string]$env:SystemDrive).StartsWith([string]$v.DriveLetter)
+            $sev = Get-FreeSpaceSeverity ([double]$v.SizeRemaining) ([double]$v.Size) $isSys
             Add-Gauge 'drives' ('{0}: space used' -f $v.DriveLetter) (100 - $freePct) '%' 100 $sev ('{0} free of {1}' -f (Format-Size $v.SizeRemaining), (Format-Size $v.Size))
             if ($sev -ne 'ok') {
-                Add-Finding 'drives' $sev ('Volume {0}: has only {1:N0} % free' -f $v.DriveLetter, $freePct) 'Low free space slows SSDs (less room for wear levelling) and can block Windows updates.' 'Free up space or move data.' ''
+                Add-Finding 'drives' $sev ('Volume {0}: is nearly full: {1} free ({2:N0} %)' -f $v.DriveLetter, (Format-Size $v.SizeRemaining), $freePct) `
+                    $(if ($isSys) { 'This is the Windows drive. Windows needs working room for updates, the page file and temporary files; if it runs out, updates fail and the PC becomes unstable.' } else { 'This is a data drive, so Windows itself is unaffected. A nearly full SSD does slow down, because it has less spare room to reorganise itself.' }) `
+                    'Free up space or move data to another drive.' ''
             }
             $vh = 'ok'; if ([string]$v.HealthStatus -ne 'Healthy') { $vh = 'warn' }
             [void]$vrows.Add(@(('{0}:' -f $v.DriveLetter), [string]$v.FileSystemLabel, [string]$v.FileSystem, (Format-Size $v.Size),
@@ -868,6 +901,9 @@ $script:UpdateErrors = @{
     '0x80240017' = 'The update was not applicable to this system.'
     '0x8024200B' = 'The installer failed; frequent with driver updates for a device that has changed.'
     '0x80246007' = 'The download did not complete.'
+    '0x80240034' = 'The update failed to download.'
+    '0x80240022' = 'The update could not be processed for this user.'
+    '0x8024402C' = 'Windows Update could not reach the update servers (proxy or DNS problem).'
     '0x80070002' = 'Files the update expected were missing; usually a damaged download cache.'
     '0x800F081F' = 'Source files were missing from the component store.'
 }
@@ -880,6 +916,11 @@ $script:StorePackages = [ordered]@{
     'GamingServices' = 'Xbox Gaming Services, used by the Xbox app and Game Pass titles.'
     'WebExperience' = 'The Windows Widgets board.'
     'WindowsStore' = 'The Microsoft Store app itself.'
+    'HPPrinterControl' = 'HP Smart, HP''s app for setting up printers and scanning.'
+    'XboxApp|GamingApp' = 'The Xbox app.'
+    'WindowsTerminal' = 'Windows Terminal, the command-line window.'
+    'NVIDIAControlPanel' = 'NVIDIA Control Panel, the settings app for NVIDIA graphics cards.'
+    'RealtekAudioControl|RealtekAudioConsole' = 'Realtek Audio Console, the settings app for the motherboard''s sound.'
 }
 Invoke-Step 'Driver inventory' {
     $script:AllDrv = @(Get-Cim 'Win32_PnPSignedDriver' | Where-Object { $_.DriverVersion -and $_.DeviceName })
@@ -912,7 +953,7 @@ Invoke-Step 'Windows installation' {
             $img = Repair-WindowsImage -Online -CheckHealth -ErrorAction Stop
             $state = [string]$img.ImageHealthState
             Add-Fact 'windows' 'Component store flag' $state
-            if ($state -ne 'Healthy') {
+            if ($state -ne 'Healthy' -and -not $DeepScan) {     # with -DeepScan the full scan below reports it once
                 $sev = 'warn'; if ($state -eq 'NonRepairable') { $sev = 'crit' }
                 Add-Finding 'windows' $sev ('Component store is flagged {0}' -f $state) 'Windows has previously detected corruption in its own servicing store.' 'Run: DISM /Online /Cleanup-Image /RestoreHealth   then: sfc /scannow' ''
             }
@@ -924,7 +965,9 @@ Invoke-Step 'Windows installation' {
             $scan = Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop
             $state = [string]$scan.ImageHealthState
             $sev = 'ok'; if ($state -eq 'Repairable') { $sev = 'warn' } elseif ($state -ne 'Healthy') { $sev = 'crit' }
-            Add-Finding 'windows' $sev ('DISM ScanHealth result: {0}' -f $state) 'Full read-only scan of the component store.' $(if ($sev -ne 'ok') { 'Run: DISM /Online /Cleanup-Image /RestoreHealth' } else { '' }) ''
+            Add-Finding 'windows' $sev $(if ($sev -eq 'ok') { 'Windows component store is healthy (full scan)' } else { 'Windows component store is damaged ({0})' -f $state }) `
+                $(if ($sev -eq 'ok') { 'Full read-only DISM scan of the store Windows uses to install updates and repair itself.' } else { 'Windows keeps a private store of spare copies of its own files, used to install updates and to repair itself. A full scan found damage in that store. The files Windows is running from are checked separately by SFC (see its result). Left alone, future updates may fail and self-repair may not work.' }) `
+                $(if ($sev -ne 'ok') { 'From an administrator prompt run: DISM /Online /Cleanup-Image /RestoreHealth   It downloads fresh copies from Microsoft and takes 10 to 20 minutes. Then restart.' } else { '' }) ''
         } catch { Add-Finding 'windows' 'info' 'DISM ScanHealth could not complete' $_.Exception.Message '' '' }
         Write-Host '      deep scan: SFC /verifyonly (several minutes)...'
         & "$env:SystemRoot\System32\sfc.exe" /verifyonly | Out-Null
@@ -957,7 +1000,9 @@ Invoke-Step 'Windows installation' {
             $script:WuSearched = $true
             $all = @(); foreach ($u in $res.Updates) { $all += $u }
             $script:WuPending = @($all | Where-Object { $_.Type -eq 2 })
-            $sw = @($all | Where-Object { $_.Type -ne 2 })
+            $swAll = @($all | Where-Object { $_.Type -ne 2 })
+            $sw = @($swAll | Where-Object { -not (Test-RoutineUpdate ([string]$_.Title)) })
+            if ($swAll.Count -gt $sw.Count) { Add-Fact 'windows' 'Antivirus definition updates queued' ('{0} (routine; they install themselves)' -f ($swAll.Count - $sw.Count)) }
             if ($sw.Count -gt 0) {
                 Add-Finding 'windows' 'warn' ('{0} Windows update(s) waiting to install' -f $sw.Count) '' 'Open Settings > Windows Update.' ''
                 $urow = New-Rows
@@ -1051,7 +1096,7 @@ Invoke-Step 'Windows installation' {
         if ($av.Count -gt 0) { Add-Fact 'windows' 'Antivirus' ($av -join ', ') }
     }
 
-    $svc = @(Get-Cim 'Win32_Service' "StartMode='Auto' AND State<>'Running'" | Where-Object { $_.ExitCode -ne 0 -and $_.ExitCode -ne 1077 })
+    $svc = @(Get-Cim 'Win32_Service' '' "StartMode='Auto' AND State<>'Running'" | Where-Object { $_.ExitCode -ne 0 -and $_.ExitCode -ne 1077 })
     if ($svc.Count -gt 0) {
         $srow = New-Rows
         foreach ($s in $svc) { [void]$srow.Add(@([string]$s.DisplayName, [string]$s.Name, [string]$s.State, [string]$s.ExitCode)) }
@@ -1310,7 +1355,17 @@ Invoke-Step 'Drivers' {
         'Microsoft in-box drivers are omitted; they are serviced by Windows Update. Age alone is not a fault: many chipset and device drivers are legitimately years old.' $true
     Add-Fact 'drivers' 'Drivers in use' ('{0} total, {1} third-party' -f $all.Count, $third.Count)
     if ($unsigned -gt 0) { Add-Finding 'drivers' 'warn' ('{0} unsigned driver(s) in use' -f $unsigned) 'See the Signed column in the driver table.' 'Replace with a signed version from the manufacturer.' '' }
-    if ($old -gt 0) { Add-Finding 'drivers' 'info' ('{0} third-party driver(s) are more than four years old' -f $old) 'Usually fine. Worth a look only for network, audio, storage and chipset devices where the maker still publishes updates.' '' '' }
+    if ($old -gt 0) {
+        $oldNames = @($third | Where-Object { $_.DriverDate -and $_.DeviceClass -ne 'DISPLAY' -and ($started - [datetime]$_.DriverDate).TotalDays / 365 -ge 4 } | ForEach-Object { '{0} ({1})' -f $_.DeviceName, (Format-Day $_.DriverDate) } | Select-Object -Unique)
+        Add-Finding 'drivers' 'info' ('{0} third-party driver(s) are more than four years old' -f $old) `
+            ('{0}. Usually fine: drivers for keyboards, mice and headsets are rarely updated. Worth a look only for network, audio, storage and chipset devices where the maker still publishes updates.' -f (($oldNames | Select-Object -First 8) -join '; ')) '' ''
+    }
+    $virt = @($all | Where-Object { Test-VirtualDevice $_ } | ForEach-Object { [string]$_.DeviceName } | Select-Object -Unique)
+    if ($virt.Count -gt 0) {
+        Add-Finding 'drivers' 'info' ('{0} virtual device(s) are installed by other software' -f $virt.Count) `
+            ('{0}. Remote-desktop, streaming and VPN programs add software-only display, network and USB devices. They are legitimate, but they sit in the same driver stacks as the real graphics card and network adapter, so they are worth knowing about when chasing black screens, display glitches or network drop-outs.' -f ($virt -join '; ')) `
+            'No action unless you are troubleshooting. If you are, uninstall the program that owns the device and see whether the problem stops.' ''
+    }
 
     # devices Windows itself says are broken
     $prob = @(Get-Cim 'Win32_PnPEntity' 'root\cimv2' 'ConfigManagerErrorCode<>0')
@@ -1407,10 +1462,11 @@ Invoke-Step 'Drivers' {
         $verdict = New-Cell 'Offered' 'info' ''
         $uDate = $null; try { $uDate = [datetime]$u.DriverVerDate } catch {}
         $match = $all | Where-Object { $_.DeviceClass -eq [string]$u.DriverClass -and $_.DriverProviderName -notmatch '^Microsoft' -and $u.DriverModel -and $_.DeviceName -eq [string]$u.DriverModel } | Select-Object -First 1
-        if ($match -and $uDate -and $match.DriverDate -and $uDate -lt [datetime]$match.DriverDate) {
+        if (-not $match) { $match = Find-OfferedDriverTarget ([string]$u.Title) ([string]$u.DriverClass) $all }
+        if ($match -and $uDate -and $match.DriverDate -and $uDate -lt ([datetime]$match.DriverDate).AddDays(-30)) {
             $conflicts++
             $verdict = New-Cell ('OLDER than installed ({0})' -f (Format-Day $match.DriverDate)) 'warn' ''
-            Add-Finding 'drivers' 'warn' ('Windows Update is offering an older driver for {0}' -f $u.DriverModel) `
+            Add-Finding 'drivers' 'warn' ('Windows Update is offering an older driver for {0}' -f $match.DeviceName) `
                 ('Offered driver is dated {0}; the installed vendor driver is dated {1}. If installed, it would downgrade the vendor driver.' -f (Format-Day $uDate), (Format-Day $match.DriverDate)) `
                 'Do not install it from Optional updates. Hide it with Microsoft''s "Show or hide updates" tool (wushowhide) if it keeps returning.' ''
         }
@@ -1433,6 +1489,19 @@ Invoke-Step 'Drivers' {
             if ($hit) {
                 Add-Finding 'drivers' 'info' ('The graphics driver in use for {0} was installed by Windows Update' -f $gpu.Name) `
                     ('Windows Update installed driver {0} on {1}, and that is the version now active. Whether that is a conflict depends on how it compares with the manufacturer''s release: see the verdict in the "Windows versus manufacturer" table. Separately, if the vendor''s control software was installed from a different release, it can report a version mismatch.' -f $gpu.DriverVersion, (Format-Stamp $hit.Date)) '' ''
+            }
+        }
+        foreach ($gpu in $script:Gpus) {
+            $act = ConvertTo-Ver ([string]$gpu.DriverVersion)
+            $vendorWord = ([string]$gpu.Name -split ' ')[0]
+            foreach ($h in ($drvHist | Where-Object { $_.ResultCode -eq 2 -and $_.Title -match 'Display' -and $_.Title -match [regex]::Escape($vendorWord) })) {
+                $hv = ConvertTo-Ver (Get-VersionFromTitle ([string]$h.Title))
+                if ($act -and $hv -and $hv -lt $act) {
+                    Add-Finding 'drivers' 'info' ('Windows Update installed an older graphics driver on {0}, since replaced' -f (Format-Day $h.Date)) `
+                        ('It installed {0}; the driver now in use is {1}, which is newer. So Windows Update has overridden the graphics driver on this PC at least once in the last {2} days.{3}' -f $hv, $act, $Days, $(if ($wuBlocked) { ' The setting that stops Windows Update delivering drivers is on now; either it was turned on after that date or it did not prevent this.' } else { '' })) `
+                        $(if ($wuBlocked) { 'Nothing to do now. If it happens again, the block is not working: check Group Policy > Windows Update > "Do not include drivers with Windows Updates".' } else { 'To stop it happening again, see the note about Windows Update and drivers in this section.' }) ''
+                    break
+                }
             }
         }
         Add-Table 'drivers' ('Drivers Windows Update installed in the last {0} days' -f $Days) @('When', 'Driver', 'Result') $hrow `
@@ -1509,8 +1578,9 @@ Invoke-Step 'Drivers' {
             $vi = ConvertTo-Ver $installed; $vl = ConvertTo-Ver $latest
             $vo = ConvertTo-Ver $optional
             if ($vi -and $vl -and $vl -gt $vi) {
-                $verdict = New-Cell 'Out of date' 'warn' ''
-                Add-Finding 'drivers' 'warn' ('{0}: graphics driver {1} installed, {2} available' -f $name, $installed, $latest) `
+                $gsev = Get-GpuDriverSeverity $ageDays
+                $verdict = New-Cell 'Out of date' $gsev ''
+                Add-Finding 'drivers' $gsev ('{0}: graphics driver {1} installed, {2} available' -f $name, $installed, $latest) `
                     ('Installed driver is dated {0}. {1}' -f (Format-Day $gpu.DriverDate), $(if ($optional) { 'A newer optional release, {0}, also exists.' -f $optional } else { '' })) `
                     'Download from the vendor (link in the table below). If the current driver is stable in your games, read the release notes first: newest is not automatically best for a GPU.' $src
             } elseif ($vi -and $vl -and $vo -and $vo -gt $vi) {
@@ -1687,6 +1757,12 @@ foreach ($e in $script:Errors) { [void]$errList.Add([string]$e) }
 $report = [ordered]@{
     meta = [ordered]@{
         computer = [string]$env:COMPUTERNAME
+        machine = [string]((@(
+                    (($script:Areas['cpu'].facts | Where-Object { $_.k -eq 'Model' } | Select-Object -First 1).v -replace '\s+\d+-Core Processor', ''),
+                    (($script:Gpus | ForEach-Object { $_.Name }) -join ' + '),
+                    $script:RamText,
+                    ($script:Areas['board'].facts | Where-Object { $_.k -eq 'Board' } | Select-Object -First 1).v
+                ) | Where-Object { $_ }) -join '  |  ')
         generated = $started.ToString('yyyy-MM-dd HH:mm')
         elevated = [bool]$IsAdmin
         days = $Days

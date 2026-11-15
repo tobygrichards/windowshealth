@@ -60,7 +60,7 @@ function global:Get-CimInstance {
             [pscustomobject]@{ DeviceName = 'Realtek Audio'; DeviceClass = 'MEDIA'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '6.0.9000.1'; DriverDate = (Get-Date).AddYears(-5); IsSigned = $true; InfName = 'hdaudio.inf' }
             [pscustomobject]@{ DeviceName = 'Realtek Gaming 2.5GbE Family Controller'; DeviceClass = 'NET'; DriverProviderName = 'Realtek'; Manufacturer = 'Realtek'; DriverVersion = '1125.99.1.1'; DriverDate = (Get-Date).AddDays(-10); IsSigned = $true; InfName = 'oem7.inf' }
         }
-        'Win32_WmiClassThatFails' { throw 'simulated failure' }
+        'Win32_Service' { if ($Namespace) { throw 'Invalid namespace' } }
         default { if ($ErrorAction -eq 'Stop' -and $ClassName -match 'Battery|FailurePredict|AntiVirus') { throw 'Invalid class' } }
     }
 }
@@ -139,6 +139,9 @@ Expect 'twin drive 0 shows its own data written' ($drv.rows[0][6] -eq '4.1 TB')
 Expect 'twin drive 2 shows its own data written' ($drv.rows[1][6] -eq '550.0 TB')
 Expect 'worn twin drive flagged' (Has 'drives' 'crit' '93 % of its rated write endurance')
 Expect 'hard disk has no life-used figure' ($drv.rows[2][5] -eq 'n/a (HDD)')
+Expect 'services query does not fail' (@($r.meta.errors | Where-Object { $_ -match 'Win32_Service' }).Count -eq 0)
+Expect 'machine summary in header' ($r.meta.machine -match '5950X' -and $r.meta.machine -match 'RX 9070 XT' -and $r.meta.machine -match 'X570')
+Expect 'nearly full Windows drive not flagged when 277 GB is free' (-not (Has 'drives' 'warn' 'Volume C') -and -not (Has 'drives' 'crit' 'Volume C'))
 $tl = (Area 'crash').tables | Where-Object { $_.title -match '^Timeline' }
 Expect 'crash section is populated when there are power losses but no blue screens' (@($tl.rows).Count -eq 3)
 Expect 'timeline: first loss was while in use, after 5 h' (($tl.rows[0][3].t -eq 'Power lost while in use') -and ($tl.rows[0][1] -eq '5 h 0 min') -and ($tl.rows[0][2] -eq '2 min'))

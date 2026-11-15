@@ -32,6 +32,13 @@ h3 { font-size: 16px; margin: 30px 0 10px; padding: 7px 12px; font-weight: 650; 
   background: var(--sunk); border-left: 4px solid var(--note); border-radius: 0 6px 6px 0; }
 a { color: var(--link); }
 .sub { color: var(--ink2); margin-top: 4px; }
+.machine { margin-top: 6px; font-weight: 600; }
+.todo { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--note); border-radius: 12px; padding: 16px 22px 8px; margin-top: 14px; }
+.todo h2 { font-size: 19px; }
+.todo ol { margin: 10px 0 0; padding: 0; list-style: none; counter-reset: todo; }
+.todo li { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); counter-increment: todo; }
+.todo li::before { content: counter(todo); flex: none; width: 22px; font-weight: 700; color: var(--ink2); text-align: right; }
+.todo .where { font-size: 13px; color: var(--ink2); }
 .num { font-variant-numeric: tabular-nums; }
 
 /* status mark: icon + label, colour is never the only signal */
@@ -163,6 +170,7 @@ var REPORT = /*__REPORT_DATA__*/null;
   document.title = 'PC Health – ' + m.computer + ' – ' + m.generated;
 
   app.appendChild(el('h1', '', 'PC Health – ' + m.computer));
+  if (m.machine) app.appendChild(el('div', 'machine', m.machine));
   app.appendChild(el('div', 'sub', 'Scanned ' + m.generated + ' · event logs for the last ' + m.days + ' days · passive read-only checks, no stress testing'));
 
   var nCrit = 0, nWarn = 0, nGap = 0;
@@ -182,6 +190,25 @@ var REPORT = /*__REPORT_DATA__*/null;
     tiles.appendChild(t);
   });
   app.appendChild(tiles);
+
+  // What to do first: faults before gaps, most severe first, across every section
+  var todo = [];
+  areas.forEach(function (a) { a.findings.forEach(function (f) { if (f.sev === 'crit' || f.sev === 'warn' || f.sev === 'gap') todo.push({ a: a, f: f }); }); });
+  todo.sort(function (x, y) { return ORDER[x.f.sev] - ORDER[y.f.sev]; });
+  if (todo.length) {
+    var box = el('div', 'todo'); box.appendChild(el('h2', '', 'What to look at first'));
+    var ol = el('ol');
+    todo.slice(0, 7).forEach(function (x) {
+      var li = el('li'); var d = dot(x.f.sev); d.title = LABEL[x.f.sev]; li.appendChild(d);
+      var b = el('div'); b.appendChild(el('div', 'f-title', x.f.title));
+      if (x.f.action) { var act = el('div', 'f-action'); act.appendChild(el('b', '', 'What to do: ')); act.appendChild(document.createTextNode(x.f.action)); b.appendChild(act); }
+      var w = el('div', 'where'); w.appendChild(document.createTextNode(LABEL[x.f.sev] + ' · ')); w.appendChild(link('see ' + x.a.name, '#' + x.a.id)); b.appendChild(w);
+      li.appendChild(b); ol.appendChild(li);
+    });
+    box.appendChild(ol);
+    if (todo.length > 7) box.appendChild(el('p', 'tnote', (todo.length - 7) + ' more item(s) are listed in the sections below.'));
+    app.appendChild(box);
+  }
 
   areas.forEach(function (a) {
     var s = el('section'); s.id = a.id;

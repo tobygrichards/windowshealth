@@ -276,5 +276,52 @@ Check 'hardware errors named, PSU not' (($s4.Detail -match 'CPU or memory') -and
 $s5 = Get-PowerLossSummary @('asleep') $true 0 0 $true
 Check 'rail evidence but only asleep losses: PSU not tied to them' ($s5.PsuTitle -match 'credible suspect') $false
 
+# ---- SSD life: the figures from a real report (SATA drives publish remaining "Life", not "Percentage Used")
+function Lv($name, $v) { [pscustomobject]@{ Type = 'Level'; Name = $name; Value = [double]$v } }
+Check 'life used: SATA "Life" 81 means 19 used' (Get-DriveLifeUsed @((Lv 'Life' 81)) 0 'SATA') 19
+Check 'life used: "Remaining Life"' (Get-DriveLifeUsed @((Lv 'Remaining Life' 88)) 0 'SATA') 12
+Check 'life used: NVMe percentage used wins' (Get-DriveLifeUsed @((Lv 'Life' 96), (Lv 'Percentage Used' 4)) 0 'NVMe') 4
+Check 'life used: "Available Spare" is not life' ($null -eq (Get-DriveLifeUsed @((Lv 'Available Spare' 100)) $null 'NVMe')) $true
+Check 'life used: Windows 0 on SATA is not trusted' ($null -eq (Get-DriveLifeUsed @() 0 'SATA')) $true
+Check 'life used: Windows value on NVMe is used' (Get-DriveLifeUsed @() 3 'NVMe') 3
+Check 'life used: nothing reported' ($null -eq (Get-DriveLifeUsed @() $null 'SATA')) $true
+Check 'drive age note at 47,645 h' ((Get-DriveAgeNote 47645) -match '5\.4 years') $true
+Check 'no drive age note at 7,809 h' (Get-DriveAgeNote 7809) ''
+
+# ---- free space (figures from the same report)
+Check 'space: 282 GB free of 3.64 TB system drive is fine' (Get-FreeSpaceSeverity 282GB 3.64TB $true) 'ok'
+Check 'space: 44 GB free of 931 GB data drive is a warning, not critical' (Get-FreeSpaceSeverity 44GB 931GB $false) 'warn'
+Check 'space: system drive under 10 GB is critical' (Get-FreeSpaceSeverity 6GB 500GB $true) 'crit'
+Check 'space: system drive under 25 GB warns' (Get-FreeSpaceSeverity 20GB 500GB $true) 'warn'
+Check 'space: data drive never critical' (Get-FreeSpaceSeverity 1GB 500GB $false) 'warn'
+Check 'space: half-full data drive' (Get-FreeSpaceSeverity 236GB 466GB $false) 'ok'
+
+# ---- memory maker
+Check 'maker from Corsair part number' (Get-MemoryMaker 'Unknown' 'CMK64GX4M2D3600C18') 'Corsair'
+Check 'maker from G.Skill part number' (Get-MemoryMaker '' 'F4-3600C16-16GTZN') 'G.Skill'
+Check 'reported maker kept' (Get-MemoryMaker 'Kingston' 'CMK64') 'Kingston'
+Check 'maker unknown' (Get-MemoryMaker 'Unknown' 'XYZ123') 'Not reported'
+
+# ---- updates and offers
+Check 'defender definitions are routine' (Test-RoutineUpdate 'Security Intelligence Update for Microsoft Defender Antivirus - KB2267602 (Version 1.4)') $true
+Check 'cumulative update is not routine' (Test-RoutineUpdate '2026-11 Cumulative Update for Windows 11 (KB5132061)') $false
+Check 'recent gpu driver behind is a note' (Get-GpuDriverSeverity 19) 'info'
+Check 'old gpu driver behind is a warning' (Get-GpuDriverSeverity 200) 'warn'
+Check 'version from title' (Get-VersionFromTitle 'NVIDIA Display Driver Update (32.0.16.1088)') '32.0.16.1088'
+Check 'no version in title' (Get-VersionFromTitle 'Logitech Extension Driver Update') ''
+$inst = @(
+    [pscustomobject]@{ DeviceName = 'Realtek High Definition Audio'; DeviceClass = 'MEDIA'; Manufacturer = 'Realtek'; DriverProviderName = 'Realtek Semiconductor Corp.'; DriverDate = [datetime]'2026-04-14' },
+    [pscustomobject]@{ DeviceName = 'NVIDIA High Definition Audio'; DeviceClass = 'MEDIA'; Manufacturer = 'NVIDIA'; DriverProviderName = 'NVIDIA Corporation'; DriverDate = [datetime]'2026-08-25' },
+    [pscustomobject]@{ DeviceName = 'NVIDIA Virtual Audio Device (Wave Extensible) (WDM)'; DeviceClass = 'MEDIA'; Manufacturer = 'NVIDIA'; DriverProviderName = 'NVIDIA'; DriverDate = [datetime]'2026-04-08' },
+    [pscustomobject]@{ DeviceName = 'Parsec Virtual Display Adapter'; DeviceClass = 'DISPLAY'; Manufacturer = 'Parsec'; DriverProviderName = 'Parsec Cloud, Inc.'; DriverDate = [datetime]'2024-01-25' },
+    [pscustomobject]@{ DeviceName = 'Realtek PCIe GbE Family Controller'; DeviceClass = 'NET'; Manufacturer = 'Realtek'; DriverProviderName = 'Realtek'; DriverDate = [datetime]'2025-03-10' })
+Check 'offer target: 2016 Realtek sound offer maps to installed Realtek audio' (Find-OfferedDriverTarget 'Realtek Semiconductor Corp. - MEDIA - 6/3/2016 12:00:00 AM - 6.0.1.7841' 'Sound' $inst).DeviceName 'Realtek High Definition Audio'
+Check 'offer target: by class when title has no class' (Find-OfferedDriverTarget 'NVIDIA Display Driver Update (32.0.16.1088)' 'Display' $inst | Measure-Object).Count 0
+Check 'offer target: unknown vendor' ($null -eq (Find-OfferedDriverTarget 'Logitech Extension Driver Update (2.0.998.0)' 'Extension' $inst)) $true
+Check 'offer target: unsupported class' ($null -eq (Find-OfferedDriverTarget 'Micro-Star INT''L CO., LTD. System Driver Update (1.0.0.16)' 'OtherHardware' $inst)) $true
+Check 'virtual: Parsec display' (Test-VirtualDevice $inst[3]) $true
+Check 'virtual: real network card is not' (Test-VirtualDevice $inst[4]) $false
+Check 'virtual: audio class is not listed' (Test-VirtualDevice $inst[2]) $false
+
 Write-Host ('{0} passed, {1} failed' -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $script:Fail

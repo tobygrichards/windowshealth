@@ -471,3 +471,96 @@ function Get-PowerLossSummary($states, [bool]$railEvidence, [int]$withHardwareEr
     }
     return $r
 }
+
+# ------------------------------------------------------------------------------------------------
+# Smaller judgements
+
+# Percentage of an SSD's rated life consumed, or $null when nothing trustworthy reports it.
+# NVMe drives publish "Percentage Used"; SATA drives publish remaining life ("Life" or "Remaining Life").
+# Windows' own wear counter is only a fallback: on SATA drives it commonly reads 0 whatever the truth.
+function Get-DriveLifeUsed($driveSensors, $windowsWear, [string]$busType) {
+    $pu = $driveSensors | Where-Object { $_.Type -eq 'Level' -and $_.Name -match 'Percentage Used' } | Select-Object -First 1
+    if ($pu) { return [double]$pu.Value }
+    $rl = $driveSensors | Where-Object { $_.Type -eq 'Level' -and $_.Name -match '^(Remaining )?Life$' } | Select-Object -First 1
+    if ($rl) { return [double](100 - $rl.Value) }
+    if ($null -eq $windowsWear) { return $null }
+    if ([double]$windowsWear -eq 0 -and $busType -ne 'NVMe') { return $null }
+    return [double]$windowsWear
+}
+
+function Get-DriveAgeNote([double]$powerOnHours) {
+    if ($powerOnHours -lt 40000) { return '' }
+    return ('{0:N0} hours powered on, about {1:N1} years of continuous running' -f $powerOnHours, ($powerOnHours / 8766))
+}
+
+# Free space is judged on gigabytes as well as percentage: 8 % free of a 4 TB drive is plenty.
+# Only the Windows drive can be critical, because only a full Windows drive stops the PC working.
+function Get-FreeSpaceSeverity([double]$freeBytes, [double]$sizeBytes, [bool]$isSystem) {
+    $gb = $freeBytes / 1GB; $pct = 100 * $freeBytes / $sizeBytes
+    if ($isSystem) {
+        if ($gb -lt 10) { return 'crit' }
+        if ($gb -lt 25 -or $pct -lt 5) { return 'warn' }
+        return 'ok'
+    }
+    if ($gb -lt 10 -or $pct -lt 5) { return 'warn' }
+    return 'ok'
+}
+
+# Module maker from the part number when the module itself does not say.
+function Get-MemoryMaker([string]$maker, [string]$part) {
+    $m = $maker.Trim()
+    if ($m -and $m -notmatch '^(Unknown|Undefined|0+|[0-9A-Fa-f]{4})$') { return $m }
+    $p = $part.Trim()
+    if ($p -match '^CM[A-Z]') { return 'Corsair' }
+    if ($p -match '^F[345]-') { return 'G.Skill' }
+    if ($p -match '^(KF|KHX|KVR|KCP)') { return 'Kingston' }
+    if ($p -match '^(BL|CT)\d') { return 'Crucial' }
+    if ($p -match '^(TF|TED|TLZ)') { return 'TeamGroup' }
+    if ($p -match '^(PV|PSD)') { return 'Patriot' }
+    if ($p -match '^(AX|AD)\d') { return 'ADATA' }
+    if ($p -match '^M3[0-9A-Z]{2}[A-Z]') { return 'Samsung' }
+    if ($p -match '^HM[A-Z]') { return 'SK hynix' }
+    return 'Not reported'
+}
+
+# Antivirus definition updates arrive several times a day and install themselves; they are not "pending updates".
+function Test-RoutineUpdate([string]$title) { return ($title -match 'Security Intelligence Update|Definition Update for (Microsoft|Windows) Defender') }
+
+# A graphics driver only slightly behind is a note; one that has been left for months is a warning.
+function Get-GpuDriverSeverity([double]$driverAgeDays) { if ($driverAgeDays -le 60) { return 'info' } return 'warn' }
+
+# "NVIDIA Display Driver Update (32.0.16.1088)" -> "32.0.16.1088"
+function Get-VersionFromTitle([string]$title) {
+    $m = [regex]::Matches($title, '\d+\.\d+\.\d+\.\d+')
+    if ($m.Count -gt 0) { return $m[$m.Count - 1].Value }
+    return ''
+}
+
+# The installed driver that a Windows Update driver offer would replace, or nothing when that cannot be
+# worked out. Matching is by vendor and device class, so it is only attempted for classes where one PC
+# normally has one such device from a vendor (sound, display, network, Bluetooth).
+function Find-OfferedDriverTarget([string]$title, [string]$class, $drivers) {
+    $vendor = ''
+    foreach ($v in 'Realtek', 'NVIDIA', 'Advanced Micro Devices|AMD', 'Intel', 'MediaTek', 'Qualcomm', 'Broadcom', 'Marvell') { if ($title -match ('^({0})\b' -f $v)) { $vendor = $v; break } }
+    if (-not $vendor) { return }
+    $token = $class
+    if ($title -match ' - ([A-Za-z]+) - ') { $token = $Matches[1] }
+    $want = ''
+    if ($token -match '^(Sound|Audio|MEDIA)$') { $want = 'MEDIA' }
+    elseif ($token -match '^Display$') { $want = 'DISPLAY' }
+    elseif ($token -match '^Net(work)?$') { $want = 'NET' }
+    elseif ($token -match '^Bluetooth$') { $want = 'BLUETOOTH' }
+    if (-not $want) { return }
+    return ($drivers | Where-Object {
+            $_.DeviceClass -eq $want -and $_.DriverProviderName -notmatch '^Microsoft' -and $_.DriverDate -and
+            (('{0} {1}' -f $_.Manufacturer, $_.DriverProviderName) -match $vendor) -and ([string]$_.DeviceName) -notmatch 'Virtual'
+        } | Sort-Object { [datetime]$_.DriverDate } -Descending | Select-Object -First 1)
+}
+
+# Software-created display, network and USB devices. They are legitimate, but they sit in the same driver
+# stacks as the real hardware and are worth knowing about when chasing instability or black screens.
+function Test-VirtualDevice($driver) {
+    if ([string]$driver.DriverProviderName -match '^Microsoft') { return $false }
+    if ($driver.DeviceClass -notin 'DISPLAY', 'NET', 'USB') { return $false }
+    return (('{0} {1}' -f $driver.DeviceName, $driver.DriverProviderName) -match 'Virtual|Parsec|TeamViewer|OpenVPN|TAP-Windows|WireGuard|Wintun|Sunshine|spacedesk|Duet|VPN')
+}
