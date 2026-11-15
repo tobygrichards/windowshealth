@@ -218,6 +218,8 @@ function Get-LhmLibrary {
 $script:SensorMap = @{}
 $script:Watched = $false
 $script:LowLevelBroken = $false
+$script:ChipDistrust = @()
+$script:Monitors = @()
 function Read-LhmHardware($hw) {
     $hw.Update()
     foreach ($s in $hw.Sensors) {
@@ -228,10 +230,11 @@ function Read-LhmHardware($hw) {
             if (-not $o) {
                 $o = [pscustomobject]@{
                     Hw = [string]$hw.Name; HwType = [string]$hw.HardwareType
-                    Name = [string]$s.Name; Type = [string]$s.SensorType; Value = $v; Min = $v; Max = $v; Valid = $true }
+                    Name = [string]$s.Name; Type = [string]$s.SensorType; Value = $v; Min = $v; Max = $v; Valid = $true; Note = ''; Step = 0.0 }
                 $script:SensorMap[$key] = $o
                 [void]$script:Sensors.Add($o)
             } else {
+                $jump = [math]::Abs($v - $o.Value); if ($jump -gt $o.Step) { $o.Step = $jump }
                 $o.Value = $v
                 if ($v -lt $o.Min) { $o.Min = $v }
                 if ($v -gt $o.Max) { $o.Max = $v }
@@ -278,6 +281,10 @@ if (-not $NoSensors) {
                 Write-Host ('      WATCH MODE: recording sensors for {0} minute(s). Use the PC as you normally would (play a game).' -f $WatchMinutes) -ForegroundColor Cyan
             }
             $until = (Get-Date).AddMinutes($WatchMinutes); $tick = 0
+            if ($WatchMinutes -le 0) {
+                # snapshot: three samples a second apart, enough to expose a sensor that jumps about
+                foreach ($i in 1..2) { foreach ($hw in $computer.Hardware) { try { Read-LhmHardware $hw } catch {} }; Start-Sleep -Milliseconds 1000 }
+            }
             do {
                 foreach ($hw in $computer.Hardware) { try { Read-LhmHardware $hw } catch {} }
                 if ($WatchMinutes -gt 0) {
@@ -299,6 +306,27 @@ if (-not $NoSensors) {
             foreach ($s in $script:Sensors) { if ($s.HwType -match '^Cpu$|SuperIO|EmbeddedController|Motherboard') { $s.Valid = $false } }
         }
         foreach ($s in $script:Sensors) { if ($s.Type -eq 'Temperature' -and ($s.Max -le 0 -or $s.Max -gt 150)) { $s.Valid = $false } }
+
+        # ---- plausibility checks. The board's Super I/O chip (Nuvoton, ITE, Fintek) is the least trustworthy source:
+        # its inputs are wired differently on every board and other monitoring software can corrupt its readings.
+        foreach ($s in $script:Sensors) {
+            if (-not $s.Valid) { continue }
+            # nothing with thermal mass moves 20 C in a second, and a supply rail does not jump 10 % between samples
+            if ($s.Type -eq 'Temperature' -and $s.Step -gt 20) { $s.Valid = $false; $s.Note = ('Erratic: jumped {0:N0} C between samples a few seconds apart, which is not physically possible' -f $s.Step) }
+            if ($s.Type -eq 'Voltage' -and $s.HwType -eq 'SuperIO' -and $s.Max -gt 0.5 -and ($s.Step / $s.Max) -gt 0.10) { $s.Valid = $false; $s.Note = 'Erratic: jumped more than 10 % between samples a few seconds apart' }
+        }
+        # cross-check the chip's CPU temperature against the CPU's own internal sensor
+        $own = $script:Sensors | Where-Object { $_.Valid -and $_.HwType -eq 'Cpu' -and $_.Type -eq 'Temperature' -and $_.Name -match 'Package|Tctl|Tdie' } | Sort-Object Value -Descending | Select-Object -First 1
+        if ($own) {
+            foreach ($chip in @($script:Sensors | Where-Object { $_.HwType -eq 'SuperIO' } | ForEach-Object { $_.Hw } | Select-Object -Unique)) {
+                $c = $script:Sensors | Where-Object { $_.Valid -and $_.Hw -eq $chip -and $_.Type -eq 'Temperature' -and $_.Name -match '^CPU' } | Select-Object -First 1
+                if ($c -and [math]::Abs($c.Value - $own.Value) -gt 25) {
+                    $script:ChipDistrust += ('{0} reports the CPU at {1:N0} C while the CPU''s own sensor says {2:N0} C' -f $chip, $c.Value, $own.Value)
+                    foreach ($s in $script:Sensors) { if ($s.Hw -eq $chip -and $s.Type -eq 'Temperature') { $s.Valid = $false; $s.Note = 'Ignored: this chip''s CPU temperature disagrees with the CPU''s own sensor, so its temperatures are not trusted' } }
+                }
+            }
+        }
+        $script:Monitors = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(ArmouryCrate|ArmourySocketServer|asus_framework|AsusFanControlService|AISuite3|DipAwayMode|HWiNFO|HWMonitor|iCUE|NZXT CAM|FanControl|OpenRGB|SignalRgb|AMDRyzenMasterDriver|AMD Ryzen Master|MSIAfterburner|SIV64X|AIDA64|CoreTemp|OpenHardwareMonitor|LibreHardwareMonitor)' } | ForEach-Object { $_.ProcessName } | Select-Object -Unique)
     }
     if (-not $script:SensorSource -and -not $script:SensorNote) {
         $script:SensorNote = 'LibreHardwareMonitor could not be loaded (see collection notes).'
@@ -365,7 +393,7 @@ function Get-SensorUnit([string]$type) {
 }
 # Returns @(severity, assessment text, finding detail or '', expected-range text)
 function Get-SensorVerdict($s) {
-    if (-not $s.Valid) { return @('info', 'Invalid reading, ignored', '', '') }
+    if (-not $s.Valid) { $t = 'Invalid reading, ignored'; if ($s.Note) { $t = $s.Note }; return @('info', $t, '', '') }
     $sp = @(Get-SensorSpec $s)
     if ($sp.Count -eq 0) {
         $why = ''
@@ -378,10 +406,18 @@ function Get-SensorVerdict($s) {
     $u = Get-SensorUnit $s.Type
     if ($sp[1] -ge 1e9) { $range = ('above {0:0.##}{1}' -f ($sp[0] - 1), $u) } else { $range = ('{0:0.##} to {1:0.##}{2}' -f $sp[0], $sp[1], $u) }
     $detail = ''; if ($sp[5]) { $detail = $sp[4] }
-    if ($s.Max -ge $sp[3]) { return @('crit', ('{0:0.##}{1} is beyond the safe limit of {2:0.##}{1}' -f $s.Max, $u, $sp[3]), $detail, $range) }
-    if ($s.Min -le $sp[2]) { return @('crit', ('{0:0.##}{1} is below the safe limit of {2:0.##}{1}' -f $s.Min, $u, $sp[2]), $detail, $range) }
-    if ($s.Max -gt $sp[1]) { return @('warn', ('{0:0.##}{1} is above the expected range' -f $s.Max, $u), $detail, $range) }
-    if ($s.Min -lt $sp[0]) { return @('warn', ('{0:0.##}{1} is below the expected range' -f $s.Min, $u), $detail, $range) }
+    $sev = ''; $txt = ''
+    if ($s.Max -ge $sp[3]) { $sev = 'crit'; $txt = ('{0:0.##}{1} is beyond the safe limit of {2:0.##}{1}' -f $s.Max, $u, $sp[3]) }
+    elseif ($s.Min -le $sp[2]) { $sev = 'crit'; $txt = ('{0:0.##}{1} is below the safe limit of {2:0.##}{1}' -f $s.Min, $u, $sp[2]) }
+    elseif ($s.Max -gt $sp[1]) { $sev = 'warn'; $txt = ('{0:0.##}{1} is above the expected range' -f $s.Max, $u) }
+    elseif ($s.Min -lt $sp[0]) { $sev = 'warn'; $txt = ('{0:0.##}{1} is below the expected range' -f $s.Min, $u) }
+    if ($sev) {
+        if ($s.HwType -eq 'SuperIO') {
+            # single unconfirmed source: report it, but as something to verify rather than a fault
+            $sev = 'warn'; $txt += '. Low-confidence source (board sensor chip): confirm in the BIOS before acting'
+        }
+        return @($sev, $txt, $detail, $range)
+    }
     return @('ok', 'Within expected range', '', $range)
 }
 
@@ -687,6 +723,7 @@ Invoke-Step 'Power supply' {
             if ([math]::Abs($dev) -le 15) {
                 $judged++
                 $sev = 'ok'; if ([math]::Abs($dev) -gt 8) { $sev = 'crit' } elseif ([math]::Abs($dev) -gt 5) { $sev = 'warn' }
+                if ($sev -eq 'crit' -and $v.HwType -eq 'SuperIO') { $sev = 'warn' }   # one unconfirmed source never raises a critical
                 $cell = New-Cell ('{0:+0.0;-0.0} % vs {1} V at worst' -f $dev, $nominal) $sev ''
                 if ($sev -ne 'ok') {
                     Add-Finding 'psu' $sev ('{0} rail reached {1:+0.0;-0.0} % from nominal (range {2:N2} to {3:N2} V)' -f $v.Name, $dev, $v.Min, $v.Max) `
@@ -806,6 +843,22 @@ Invoke-Step 'Motherboard' {
     }
     if ($script:Whea.Count -eq 0) { Add-Finding 'board' 'ok' 'No hardware error (WHEA) events logged' ('Nothing in the last {0} days.' -f $Days) '' '' }
 
+    $chips = @($script:Sensors | Where-Object { $_.HwType -eq 'SuperIO' } | ForEach-Object { $_.Hw } | Select-Object -Unique)
+    if ($chips.Count -gt 0) {
+        Add-Fact 'board' 'Sensor chip' ($chips -join ', ')
+        $erratic = @($script:Sensors | Where-Object { $_.HwType -eq 'SuperIO' -and $_.Note -match '^Erratic' })
+        $detail = 'Readings from this chip are the least reliable in the report. Its inputs are wired and scaled differently on every board, unused inputs float, and it can be corrupted if another monitoring program reads it at the same moment. So this tool treats it as a low-confidence source: a chip reading on its own can raise a "verify this" warning but never a critical, and CPU, GPU and drive verdicts use each device''s own internal sensor instead.'
+        if ($script:ChipDistrust.Count -gt 0) { $detail += ' Cross-check FAILED: ' + ($script:ChipDistrust -join '; ') + '. Its temperatures were discarded.' }
+        elseif (@($script:Sensors | Where-Object { $_.Valid -and $_.HwType -eq 'SuperIO' -and $_.Type -eq 'Temperature' -and $_.Name -match '^CPU' }).Count -gt 0) { $detail += ' Cross-check passed: its CPU temperature agrees with the CPU''s own sensor to within 25 C.' }
+        if ($erratic.Count -gt 0) { $detail += (' {0} reading(s) jumped implausibly between samples and were discarded.' -f $erratic.Count) }
+        $sev = 'info'; if ($script:ChipDistrust.Count -gt 0) { $sev = 'warn' }
+        Add-Finding 'board' $sev ('Board sensor chip ({0}) is treated as a low-confidence source' -f ($chips -join ', ')) $detail 'The BIOS hardware monitor is the reference for anything this chip reports.' ''
+    }
+    if ($script:Monitors.Count -gt 0) {
+        Add-Finding 'board' 'info' 'Other hardware-monitoring software was running during the scan' `
+            ('Running: {0}. Two programs reading the board''s sensor chip at once is a known cause of garbage values, because the chip is read through a shared register that one program can change while the other is mid-read.' -f ($script:Monitors -join ', ')) `
+            'For the cleanest readings, close these (including their tray icons and services) and re-run.' ''
+    }
     $boardT = Get-Sens 'SuperIO|Motherboard|EmbeddedController' 'Temperature'
     foreach ($t in ($boardT | Where-Object { @(Get-SensorSpec $_).Count -gt 0 } | Sort-Object Max -Descending | Select-Object -First 4)) {
         $vd = Get-SensorVerdict $t
